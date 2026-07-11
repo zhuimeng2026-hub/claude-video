@@ -13,6 +13,8 @@ SOURCE_FRAMES = OUT / "source_frames"
 EDITED_FRAMES = OUT / "edited_keyframes"
 CLIPS = OUT / "clips"
 FINAL_VIDEO = OUT / "byd_shark_keyframe_image_poc.mp4"
+FULL_TIMELINE_VIDEO = OUT / "byd_shark_keyframe_image_full_timeline.mp4"
+FULL_TIMELINE_FILTER = OUT / "full_timeline_filter_complex.txt"
 CONTACT_SHEET = OUT / "keyframe_image_poc_sheet.jpg"
 
 W, H = 1280, 720
@@ -70,6 +72,34 @@ def run(cmd: list[str]) -> None:
         raise SystemExit(
             f"Command failed:\n{' '.join(cmd)}\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
         )
+
+
+def parse_time(value: str) -> float:
+    parts = value.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Expected HH:MM:SS.s time, got: {value}")
+    hours, minutes, seconds = parts
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def probe_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"ffprobe failed for {path}:\n{result.stderr}")
+    return float(result.stdout.strip())
 
 
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -258,6 +288,75 @@ def concat_clips() -> None:
     )
 
 
+def video_chain(input_label: str, output_label: str, trim: str) -> str:
+    return (
+        f"{input_label}{trim},setpts=PTS-STARTPTS,"
+        f"scale={W}:{H},fps={FPS},setsar=1,format=yuv420p{output_label}"
+    )
+
+
+def build_full_timeline_video() -> None:
+    duration = probe_duration(VIDEO)
+    inputs = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(VIDEO)]
+    for index in range(1, len(SHOTS) + 1):
+        inputs.extend(["-i", str(CLIPS / f"clip_{index:02d}.mp4")])
+
+    chains: list[str] = []
+    labels: list[str] = []
+    cursor = 0.0
+    label_index = 0
+
+    for index, shot in enumerate(SHOTS, start=1):
+        start = parse_time(shot["time"])
+        end = min(start + CLIP_SECONDS, duration)
+        if start > cursor:
+            label = f"[v{label_index}]"
+            chains.append(video_chain("[0:v]", label, f"trim=start={cursor:.3f}:end={start:.3f}"))
+            labels.append(label)
+            label_index += 1
+
+        label = f"[v{label_index}]"
+        chains.append(video_chain(f"[{index}:v]", label, f"trim=start=0:duration={end - start:.3f}"))
+        labels.append(label)
+        label_index += 1
+        cursor = end
+
+    if cursor < duration:
+        label = f"[v{label_index}]"
+        chains.append(video_chain("[0:v]", label, f"trim=start={cursor:.3f}:end={duration:.3f}"))
+        labels.append(label)
+
+    concat = "".join(labels) + f"concat=n={len(labels)}:v=1:a=0[fullv]"
+    filter_complex = ";\n".join(chains + [concat])
+    FULL_TIMELINE_FILTER.write_text(filter_complex + "\n", encoding="utf-8")
+
+    run(
+        inputs
+        + [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[fullv]",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(FULL_TIMELINE_VIDEO),
+        ]
+    )
+
+
 def main() -> None:
     if not VIDEO.exists():
         raise SystemExit(f"Source video not found: {VIDEO}")
@@ -267,9 +366,11 @@ def main() -> None:
     build_contact_sheet()
     build_image_clips()
     concat_clips()
+    build_full_timeline_video()
     print(f"Edited keyframes: {EDITED_FRAMES}")
     print(f"Contact sheet: {CONTACT_SHEET}")
-    print(f"POC video: {FINAL_VIDEO}")
+    print(f"Montage video: {FINAL_VIDEO}")
+    print(f"Full timeline video: {FULL_TIMELINE_VIDEO}")
 
 
 if __name__ == "__main__":
