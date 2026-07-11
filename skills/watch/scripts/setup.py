@@ -52,6 +52,12 @@ ENV_TEMPLATE = """# /watch API configuration
 GROQ_API_KEY=
 OPENAI_API_KEY=
 
+# SAM 2 video segmentation (optional) — used with --segment flag.
+# Get a Replicate token:  https://replicate.com/account/api-tokens
+# Leave blank to skip segmentation (non-fatal, --segment will warn and continue).
+
+REPLICATE_API_TOKEN=
+
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
@@ -250,6 +256,7 @@ def _status() -> dict:
         "missing_binaries": missing,
         "whisper_backend": backend,
         "has_api_key": has_key,
+        "has_replicate_token": bool(_read_env_key("REPLICATE_API_TOKEN")),
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),

@@ -66,6 +66,23 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
+    ap.add_argument(
+        "--segment",
+        action="store_true",
+        help="Run SAM 2 video segmentation via Replicate (requires REPLICATE_API_TOKEN).",
+    )
+    ap.add_argument(
+        "--segment-points",
+        type=str,
+        default=None,
+        help='SAM 2 prompt points as "x,y x,y ..." (default: center of first frame).',
+    )
+    ap.add_argument(
+        "--segment-labels",
+        type=str,
+        default=None,
+        help="Point labels: 1=foreground 0=background (default: all foreground).",
+    )
     args = ap.parse_args()
 
     config = get_config()
@@ -286,6 +303,46 @@ def main() -> int:
     elif not transcript_segments and video_path and not meta.get("has_audio"):
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
 
+    # ── SAM 2 segmentation (optional) ────────────────────────────────────
+    segment_result: dict | None = None
+    if args.segment and video_path:
+        try:
+            from segment import segment_video, load_replicate_token, _parse_points, _parse_labels  # noqa: E402
+            token = load_replicate_token()
+            if not token:
+                print(
+                    "[watch] --segment requires REPLICATE_API_TOKEN — skipping segmentation",
+                    file=sys.stderr,
+                )
+            else:
+                # Default to center of video frame if no points given
+                if args.segment_points:
+                    seg_points = _parse_points(args.segment_points)
+                    seg_labels = _parse_labels(args.segment_labels or " ".join("1" for _ in seg_points))
+                else:
+                    w = meta.get("width") or 320
+                    h = meta.get("height") or 240
+                    seg_points = [[w // 2, h // 2]]
+                    seg_labels = [1]
+
+                if len(seg_points) != len(seg_labels):
+                    print(
+                        f"[watch] --segment: {len(seg_points)} points but {len(seg_labels)} labels — skipping",
+                        file=sys.stderr,
+                    )
+                else:
+                    segment_result = segment_video(
+                        video_path=video_path,
+                        points=seg_points,
+                        labels=seg_labels,
+                        output_dir=work / "masks",
+                        token=token,
+                    )
+        except SystemExit as exc:
+            print(f"[watch] segmentation failed: {exc} — continuing without masks", file=sys.stderr)
+        except ImportError as exc:
+            print(f"[watch] segment module unavailable: {exc}", file=sys.stderr)
+
     info = dl.get("info") or {}
 
     print()
@@ -372,6 +429,15 @@ def main() -> int:
             )
     else:
         print("_No frames extracted._")
+
+    if segment_result and segment_result.get("masks"):
+        print()
+        print("## Segmentation Masks")
+        print()
+        print(f"Masks live at: `{work / 'masks'}`")
+        print()
+        for m in segment_result["masks"]:
+            print(f"- `{m['path']}` (frame {m['index']})")
 
     print()
     print("## Transcript")

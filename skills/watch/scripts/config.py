@@ -11,6 +11,10 @@ CONFIG_FILE = CONFIG_DIR / ".env"
 
 DEFAULT_DETAIL = "balanced"
 DEFAULT_WHISPER_BACKEND = "local"  # local|groq|openai — local uses faster-whisper
+DEFAULT_REPLICATE_MODEL = (
+    "meta/sam-2-video"
+    ":8493227172126379a30e46d88442159788e60f14b7e5a09125f0a32323c67539"
+)
 
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 WHISPER_BACKENDS = {"local", "groq", "openai"}
@@ -83,3 +87,41 @@ def frame_cap(detail: str) -> int | None:
     if detail == "transcript":
         return None
     return 100
+
+
+def get_replicate_token() -> str | None:
+    """Return the Replicate API token from env or ~/.config/watch/.env."""
+    import os as _os
+
+    def _from_env(name: str) -> str | None:
+        value = _os.environ.get(name)
+        return value.strip() if value else None
+
+    def _from_dotenv(path: Path, name: str) -> str | None:
+        if not path.exists():
+            return None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() != name:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+                    value = value[1:-1]
+                return value or None
+        except OSError:
+            return None
+        return None
+
+    dotenv_paths = [CONFIG_FILE, Path.cwd() / ".env"]
+    value = _from_env("REPLICATE_API_TOKEN")
+    if value:
+        return value
+    for p in dotenv_paths:
+        value = _from_dotenv(p, "REPLICATE_API_TOKEN")
+        if value:
+            return value
+    return None

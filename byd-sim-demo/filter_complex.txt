@@ -1,0 +1,1 @@
+[0:v][1:v]overlay=0:0:enable='between(t,5.0,10.0)'[v1];[v1][2:v]overlay=0:0:enable='between(t,15.0,25.0)'[v2];[v2][3:v]overlay=0:0:enable='between(t,25.0,30.0)'[v3];[v3][4:v]overlay=0:0:enable='between(t,35.0,45.0)'[v4];[v4][5:v]overlay=0:0:enable='between(t,70.0,75.0)'[v5];[v5][6:v]overlay=0:0:enable='between(t,90.0,95.0)'[v6]

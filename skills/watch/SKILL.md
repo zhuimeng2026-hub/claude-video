@@ -150,6 +150,9 @@ Optional flags:
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
+- `--segment` — run SAM 2 video segmentation via Replicate. Requires `REPLICATE_API_TOKEN` in `~/.config/watch/.env` or the environment. Produces binary mask frames (white = segmented object) in a `masks/` subdirectory under the work dir. The mask paths appear in a **Segmentation Masks** section of the report. Segmentation failures are non-fatal — the pipeline continues without masks.
+- `--segment-points "x,y x,y ..."` — prompt points for SAM 2 (e.g. `"320,240"` for center-screen). Defaults to the center of the video frame.
+- `--segment-labels "1 0"` — point labels: `1` = foreground, `0` = background. Must match the number of points. Defaults to all foreground.
 
 ### Focusing on a section (higher frame rate)
 
@@ -253,8 +256,9 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- When `--segment` is used: uploads the video file to Replicate's file storage (`api.replicate.com/v1/files`), runs SAM 2 video segmentation via Replicate predictions API, and downloads the resulting mask frames
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
-- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s), Replicate API token, and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
