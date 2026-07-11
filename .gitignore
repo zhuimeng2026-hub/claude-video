@@ -14,3 +14,33 @@ htmlcov/
 
 # local Claude Code settings
 .claude/settings.local.json
+
+# Local video/model processing artifacts
+/local_tools/
+
+# /watch generated output directories
+/youku_watch_test/
+/product_video_byd_shark_watch/download/
+/product_video_byd_shark_watch/frames/
+/product_video_byd_shark_watch/audio_16k.wav
+/product_video_byd_shark_watch/contact_sheet.jpg
+/product_video_byd_shark_watch/transcript_local_whisper_cpp.srt
+/product_video_byd_shark_watch/transcript_local_whisper_cpp.txt
+
+# Product replacement generated media
+/product_video_byd_shark_watch/replacement_poc/*.mp4
+/product_video_byd_shark_watch/replacement_poc/*.png
+/product_video_byd_shark_watch/replacement_poc/*.jpg
+/product_video_byd_shark_watch/replacement_poc/keyframes/
+/product_video_byd_shark_watch/replacement_poc/overlays/
+
+# Face replacement generated media
+/watch_chinese_face_video/*.mp4
+/watch_chinese_face_video/*.wav
+/watch_chinese_face_video/*.png
+/watch_chinese_face_video/*.jpg
+/watch_chinese_face_video/*.srt
+/watch_chinese_face_video/*.txt
+/watch_chinese_face_video/edited_faces/
+/watch_chinese_face_video/source_frames/
+/watch_chinese_face_video/remotion_project/public/
