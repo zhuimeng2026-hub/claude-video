@@ -45,3 +45,31 @@ htmlcov/
 /watch_chinese_face_video/edited_faces/
 /watch_chinese_face_video/source_frames/
 /watch_chinese_face_video/remotion_project/public/
+
+# Video/audio media files (too large for git)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.ogg
+
+# Workflow demo runtime artifacts
+byd-sim-demo/frames/
+byd-sim-demo/overlays/
+byd-sim-demo/*.mp4
+web-platform/work/
+web-platform/backend/video-workflow
+web-platform/backend/*.db
+
+# Go build output
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Node
+frontend/node_modules/
+frontend/dist/
