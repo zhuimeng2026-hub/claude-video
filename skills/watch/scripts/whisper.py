@@ -32,6 +32,10 @@ GROQ_MODEL = "whisper-large-v3"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
 
+# Local faster-whisper settings
+LOCAL_MODEL_SIZE = "base"  # tiny|base|small|medium|large-v3; base is fast, good enough
+LOCAL_DEVICE = "cpu"        # cpu|cuda; cpu works everywhere
+
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
@@ -368,6 +372,61 @@ def _segments_from_response(data: dict) -> list[dict]:
     return out
 
 
+def has_local_whisper() -> bool:
+    """Return True if faster-whisper is importable."""
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def transcribe_local(audio_path: Path, model_size: str = LOCAL_MODEL_SIZE) -> list[dict]:
+    """Transcribe audio using local faster-whisper (no API key needed).
+
+    Returns segments in our standard {start, end, text} format.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise SystemExit(
+            "faster-whisper is not installed. Run: pip install faster-whisper"
+        )
+
+    print(
+        f"[watch] transcribing locally with faster-whisper ({model_size})…",
+        file=sys.stderr,
+    )
+    model = WhisperModel(model_size, device=LOCAL_DEVICE, compute_type="int8")
+    segments_iter, info = model.transcribe(
+        str(audio_path),
+        beam_size=5,
+        language=None,  # auto-detect
+        vad_filter=True,
+    )
+    print(
+        f"[watch] detected language: {info.language} (prob={info.language_probability:.2f})",
+        file=sys.stderr,
+    )
+
+    segments: list[dict] = []
+    for seg in segments_iter:
+        text = seg.text.strip()
+        if not text:
+            continue
+        segments.append({
+            "start": round(seg.start, 2),
+            "end": round(seg.end, 2),
+            "text": text,
+        })
+
+    if not segments:
+        raise SystemExit("faster-whisper returned no transcript segments")
+
+    print(f"[watch] transcribed {len(segments)} segments via local faster-whisper", file=sys.stderr)
+    return segments
+
+
 def transcribe_chunks(
     chunks: list[tuple[Path, float]],
     transcribe_one,
@@ -420,13 +479,34 @@ def transcribe_video(
     """Run the full flow: extract audio → upload → parse segments.
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
+    Backend can be "groq", "openai", "local" (faster-whisper), or None (auto-detect).
     """
+    # Local faster-whisper needs no API key
+    if backend == "local":
+        if not has_local_whisper():
+            raise SystemExit("faster-whisper is not installed. Run: pip install faster-whisper")
+        print(f"[watch] extracting audio for local whisper…", file=sys.stderr)
+        audio_path = extract_audio(video_path, audio_out)
+        segments = transcribe_local(audio_path)
+        if not segments:
+            raise SystemExit("faster-whisper returned no transcript segments")
+        return segments, "local"
+
     if backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()
         backend = backend or detected_backend
         api_key = api_key or detected_key
 
     if not backend or not api_key:
+        # Check if local whisper is available as fallback
+        if has_local_whisper():
+            print(f"[watch] no API key found, falling back to local faster-whisper", file=sys.stderr)
+            print(f"[watch] extracting audio for local whisper…", file=sys.stderr)
+            audio_path = extract_audio(video_path, audio_out)
+            segments = transcribe_local(audio_path)
+            if not segments:
+                raise SystemExit("faster-whisper returned no transcript segments")
+            return segments, "local"
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
             "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
@@ -467,7 +547,7 @@ def transcribe_video(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai|local]", file=sys.stderr)
         raise SystemExit(2)
 
     video = sys.argv[1]

@@ -10,8 +10,10 @@ CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
 
 DEFAULT_DETAIL = "balanced"
+DEFAULT_WHISPER_BACKEND = "local"  # local|groq|openai — local uses faster-whisper
 
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
+WHISPER_BACKENDS = {"local", "groq", "openai"}
 
 
 def read_env_file(path: Path | None = None) -> dict[str, str]:
@@ -56,8 +58,17 @@ def get_config() -> dict[str, object]:
     if detail not in DETAILS:
         detail = DEFAULT_DETAIL
 
+    whisper_backend = (
+        os.environ.get("WHISPER_BACKEND")
+        or file_values.get("WHISPER_BACKEND")
+        or DEFAULT_WHISPER_BACKEND
+    )
+    if whisper_backend not in WHISPER_BACKENDS:
+        whisper_backend = DEFAULT_WHISPER_BACKEND
+
     return {
         "detail": detail,
+        "whisper_backend": whisper_backend,
         "config_file": str(CONFIG_FILE),
     }
 

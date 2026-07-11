@@ -19,7 +19,7 @@ from config import frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from whisper import load_api_key, transcribe_video, has_local_whisper  # noqa: E402
 
 
 def main() -> int:
@@ -56,9 +56,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "local"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help="Force a specific Whisper backend. local=faster-whisper (no API key needed).",
     )
     ap.add_argument(
         "--no-dedup",
@@ -237,14 +237,20 @@ def main() -> int:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
     if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
+        # If --whisper local was specified, or no API key and local is available
+        use_backend = args.whisper
+        if use_backend is None:
+            backend, api_key = load_api_key(None)
+            if not backend or not api_key:
+                # No API key — try local faster-whisper
+                if has_local_whisper():
+                    use_backend = "local"
+        if use_backend == "local":
             try:
                 all_segments, used_backend = transcribe_video(
                     video_path,
                     work / "audio.mp3",
-                    backend=backend,
-                    api_key=api_key,
+                    backend="local",
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)
@@ -252,16 +258,31 @@ def main() -> int:
             except SystemExit as exc:
                 print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
         else:
-            hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
-                if args.whisper else
-                "no subtitles and no Whisper API key found"
-            )
-            setup_py = SCRIPT_DIR / "setup.py"
-            print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
-                file=sys.stderr,
-            )
+            backend, api_key = load_api_key(args.whisper)
+            if backend and api_key:
+                try:
+                    all_segments, used_backend = transcribe_video(
+                        video_path,
+                        work / "audio.mp3",
+                        backend=backend,
+                        api_key=api_key,
+                    )
+                    transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+                    transcript_text = format_transcript(transcript_segments)
+                    transcript_source = f"whisper ({used_backend})"
+                except SystemExit as exc:
+                    print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
+            else:
+                hint = (
+                    f"--whisper {args.whisper} was set but the matching API key is missing"
+                    if args.whisper else
+                    "no subtitles and no Whisper API key found"
+                )
+                setup_py = SCRIPT_DIR / "setup.py"
+                print(
+                    f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                    file=sys.stderr,
+                )
     elif not transcript_segments and video_path and not meta.get("has_audio"):
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
 
