@@ -219,12 +219,16 @@ this exact shape:
 
 RULES
 1. scenes[] must be a contiguous, non-overlapping partition of [0, duration_seconds*fps).
-   The first scene is "intro" starting at frame 0; the last scene is "outro".
+   The FIRST scene must be labelled "intro" and start at frame 0. The LAST scene must
+   be labelled "outro". Middle scenes describe the body (e.g. "verse-1", "chorus-1",
+   "highlight-2"). Each scene's startFrame/endFrame are absolute composition frames.
 2. Pick render_mode "video" ONLY if a real source video exists AND using <OffthreadVideo>
    would feel more natural (e.g. music video, sports highlights). Otherwise use "frames".
 3. highlights[] are frames the composition zooms into with a callout. Pick 2-5 moments
    that align with notable transcript cues ("as you can see", choruses, key lines).
 4. Use frameIndex values that exist in the FRAME TIMESTAMPS list. Don't invent indices.
+   These are the SOURCE /watch frame numbers (1..frame_count) — the composition
+   handles mapping them to composition frames automatically.
 5. The transcript text contains the dialogue/narration — let that drive scene boundaries.
 6. Keep duration_seconds honest. If the source is 30s, don't claim 90s. Trim or expand
    proportionally to the source.
@@ -282,10 +286,15 @@ def call_llm(backend: str, model: str, prompt: str, timeout: int = 120) -> dict:
         raise SystemExit(f"unknown backend: {backend}. Choices: {', '.join(BACKENDS)}")
 
     base_url, default_model, env_var = BACKENDS[backend]
-    api_key = os.environ.get(env_var) or _read_env_file(env_var)
+    api_key = (
+        os.environ.get(env_var)
+        or _read_env_file(env_var)
+        or _read_litellm_yaml_key(env_var)
+    )
     if not api_key:
         raise SystemExit(
-            f"{backend} backend needs {env_var}. Set it in env or ~/.config/watch/.env."
+            f"{backend} backend needs {env_var}. Set it in env, ~/.config/watch/.env, "
+            f"or as `environment_variables.{env_var}` in /root/.claude/litellm.yaml."
         )
 
     model = model or default_model
@@ -336,6 +345,42 @@ def call_llm(backend: str, model: str, prompt: str, timeout: int = 120) -> dict:
             raise SystemExit(f"LLM returned unparseable response: {exc}: {raw[:400]}")
 
     raise SystemExit(f"LLM call failed after 3 attempts: {last_exc}")
+
+
+def _read_litellm_yaml_key(env_var: str) -> str | None:
+    """Best-effort parse of /root/.claude/litellm.yaml for an API key.
+
+    The file uses LiteLLM's own syntax — top-level `environment_variables:` map
+    often holds the literal key, sometimes as `name: sk-...`. We extract any
+    `sk-…` token under that section as a fallback when the env var isn't set.
+    """
+    for path in (Path("/root/.claude/litellm.yaml"), Path.home() / ".claude" / "litellm.yaml"):
+        if not path.exists():
+            continue
+        try:
+            in_env_section = False
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.rstrip()
+                stripped = line.strip()
+                if stripped.startswith("environment_variables:"):
+                    in_env_section = True
+                    continue
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if in_env_section and not line.startswith(" ") and not line.startswith("\t"):
+                    in_env_section = False
+                if not in_env_section:
+                    continue
+                key_part, sep, value_part = stripped.partition(":")
+                if not sep:
+                    continue
+                key_name = key_part.strip()
+                value = value_part.strip()
+                if key_name == env_var and value and not value.startswith("os.environ/"):
+                    return value.strip('"').strip("'")
+        except OSError:
+            continue
+    return None
 
 
 def _read_env_file(name: str) -> str | None:
@@ -424,10 +469,37 @@ def validate_and_repair(spec: dict, discovered: dict) -> dict:
         })
         cursor = end
 
-    if not norm or norm[-1]["endFrame"] < total_frames:
-        norm.append({"label": "outro", "startFrame": cursor, "endFrame": total_frames, "note": "outro"})
-    elif norm[-1]["endFrame"] > total_frames:
-        norm[-1]["endFrame"] = total_frames
+    # First scene MUST be "intro", last MUST be "outro" — Composition.tsx only
+    # renders the bookend cards when a scene with those labels exists.
+    if not norm:
+        # No scenes at all — fabricate intro + body + outro.
+        intro_end = min(fps * 3, total_frames)
+        outro_start = max(total_frames - fps * 3, intro_end)
+        norm = [
+            {"label": "intro", "startFrame": 0, "endFrame": intro_end, "note": ""},
+            {"label": "story", "startFrame": intro_end, "endFrame": outro_start, "note": ""},
+            {"label": "outro", "startFrame": outro_start, "endFrame": total_frames, "note": ""},
+        ]
+    else:
+        if norm[0]["label"].lower() != "intro":
+            norm.insert(0, {"label": "intro", "startFrame": 0, "endFrame": norm[0]["startFrame"], "note": "auto-added"})
+        if norm[-1]["label"].lower() != "outro":
+            # If the last scene is shorter than the remaining budget, extend it as outro.
+            if norm[-1]["endFrame"] < total_frames:
+                norm.append({"label": "outro", "startFrame": norm[-1]["endFrame"], "endFrame": total_frames, "note": "auto-added"})
+            else:
+                norm[-1]["label"] = "outro"
+        # Re-stretch so first scene starts at 0 and last scene ends at total_frames.
+        first = norm[0]
+        last = norm[-1]
+        old_first = first["startFrame"]
+        old_last = last["endFrame"]
+        if old_last > old_first:
+            for s in norm:
+                s["startFrame"] = round((s["startFrame"] - old_first) / (old_last - old_first) * total_frames)
+                s["endFrame"] = round((s["endFrame"] - old_first) / (old_last - old_first) * total_frames)
+            norm[0]["startFrame"] = 0
+            norm[-1]["endFrame"] = total_frames
 
     out["scenes"] = norm
 
@@ -527,101 +599,105 @@ export const RemotionRoot: React.FC = () => {
 """
 
 COMPOSITION_TSX = """import React from "react";
-import { AbsoluteFill, Sequence as RemotionSequence, Series, useVideoConfig, staticFile, Audio, OffthreadVideo, Video } from "remotion";
+import { AbsoluteFill, Sequence as RemotionSequence, useVideoConfig, staticFile, OffthreadVideo } from "remotion";
 import spec from "../public/spec.json";
 import cues from "../public/cues.json";
 import { Subtitles } from "./Subtitles";
 import { IntroCard } from "./IntroCard";
 import { OutroCard } from "./OutroCard";
 
-const { duration_seconds, fps, scenes, highlights, render_mode, subtitle_style } = spec;
+const { duration_seconds, fps, scenes, highlights, render_mode, subtitle_style, intro: introSpec, outro: outroSpec, source_frame_count } = spec as any;
 
 type Cue = { start: number; end: number; text: string };
+type Scene = { label: string; startFrame: number; endFrame: number; note?: string };
+type Highlight = { frameIndex: number; caption: string };
 
-// Frames land at scene-aware timestamps. The composition reads its scene list
-// from public/spec.json (designed by the LLM) and renders each scene with the
-// right visuals + a zoom-in callout for highlight frames.
+// The LLM's scenes partition [0, duration*fps). The Composition walks that
+// partition each frame: scenes labelled intro/outro show the bookend cards
+// overlaid on the backdrop, other scenes show the frame backdrop with
+// optional highlight callouts.
 export const Composition_: React.FC = () => {
-  const { durationInFrames } = useVideoConfig();
-  const intro = scenes[0];
-  const outro = scenes[scenes.length - 1];
-  const middle = scenes.slice(1, -1);
+  const totalFrames = duration_seconds * fps;
 
-  // Map highlight frame indices → scene + offset within scene for the callout
-  const highlightByScene = new Map<number, { offset: number; caption: string }[]>();
-  for (const h of highlights as Array<{ frameIndex: number; caption: string }>) {
-    // We treat frameIndex as an absolute composition frame, then resolve it
-    // back to a scene by walking the partition.
-    const scene = scenes.find(
-      (s: { startFrame: number; endFrame: number }) =>
-        h.frameIndex >= s.startFrame && h.frameIndex < s.endFrame,
+  // Map source /watch frame numbers → absolute composition frames via the
+  // scene they're declared in. Highlights carry frameIndex (source frame #).
+  const highlighted = (highlights as Highlight[]).map((h) => {
+    const scene = (scenes as Scene[]).find(
+      (s) => h.frameIndex >= s.startFrame && h.frameIndex < s.endFrame,
     );
-    if (!scene) continue;
-    const list = highlightByScene.get(scenes.indexOf(scene)) || [];
-    list.push({ offset: h.frameIndex - scene.startFrame, caption: h.caption });
-    highlightByScene.set(scenes.indexOf(scene), list);
-  }
+    if (!scene) return { compFrame: -1, caption: h.caption };
+    // The source frame lives inside this scene's frame range — treat its
+    // position proportionally as a composition frame inside the same range.
+    const sceneLen = scene.endFrame - scene.startFrame;
+    const localFrac = sceneLen > 0 ? (h.frameIndex - scene.startFrame) / sceneLen : 0;
+    const compFrame = Math.round(scene.startFrame + localFrac * sceneLen);
+    return { compFrame, caption: h.caption };
+  });
+
+  const introScene = (scenes as Scene[]).find((s) => /^intro$/i.test(s.label));
+  const outroScene = (scenes as Scene[]).find((s) => /^outro$/i.test(s.label));
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
-      {/* Background layer: either OffthreadVideo or a frames-based backdrop */}
+      {/* Background layer */}
       {render_mode === "video" ? (
         <OffthreadVideo
           src={staticFile("source.mp4")}
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
         />
       ) : (
-        <FramesBackdrop scenes={middle} highlightByScene={highlightByScene} />
+        <FramesBackdrop scenes={scenes as Scene[]} highlighted={highlighted} sourceFrameCount={source_frame_count || 100} />
       )}
 
-      {/* Intro card */}
-      <RemotionSequence from={intro.startFrame} durationInFrames={intro.endFrame - intro.startFrame}>
-        <IntroCard headline={(spec as any).intro?.headline || spec.title} subline={(spec as any).intro?.subline || ""} />
-      </RemotionSequence>
+      {/* Intro card overlay (if LLM included an intro scene) */}
+      {introScene ? (
+        <RemotionSequence from={introScene.startFrame} durationInFrames={introScene.endFrame - introScene.startFrame}>
+          <IntroCard headline={introSpec?.headline || spec.title} subline={introSpec?.subline || ""} />
+        </RemotionSequence>
+      ) : null}
 
-      {/* Outro card */}
-      <RemotionSequence from={outro.startFrame} durationInFrames={outro.endFrame - outro.startFrame}>
-        <OutroCard headline={(spec as any).outro?.headline || "Thanks"} cta={(spec as any).outro?.cta || ""} />
-      </RemotionSequence>
+      {/* Outro card overlay */}
+      {outroScene ? (
+        <RemotionSequence from={outroScene.startFrame} durationInFrames={outroScene.endFrame - outroScene.startFrame}>
+          <OutroCard headline={outroSpec?.headline || "Thanks"} cta={outroSpec?.cta || ""} />
+        </RemotionSequence>
+      ) : null}
 
       {/* Subtitles overlaid on the whole composition */}
       <Subtitles
         cues={cues as Cue[]}
         fps={fps}
-        durationInFrames={durationInFrames}
+        durationInFrames={totalFrames}
         style={subtitle_style}
       />
     </AbsoluteFill>
   );
 };
 
-// Frames-based backdrop: pick the frame whose absolute composition index is
-// nearest the current frame, per-scene. Highlights zoom in for ~1 second.
+// Frames-based backdrop: walks the scene list each frame to pick the current
+// scene, then maps the absolute composition frame to a source frame_NNNN.jpg.
+// Highlights zoom in for ~1 second and show a caption strip.
 const FramesBackdrop: React.FC<{
-  scenes: Array<{ label: string; startFrame: number; endFrame: number }>;
-  highlightByScene: Map<number, { offset: number; caption: string }[]>;
-}> = ({ scenes, highlightByScene }) => {
-  const frame = useVideoConfig().absoluteFrame;
-  // Walk scenes to know which one we're inside
-  const sceneIdx = scenes.findIndex(
-    (s) => frame >= s.startFrame && frame < s.endFrame,
-  );
+  scenes: Scene[];
+  highlighted: Array<{ compFrame: number; caption: string }>;
+  sourceFrameCount: number;
+}> = ({ scenes, highlighted, sourceFrameCount }) => {
+  const { fps, absoluteFrame: frame } = useVideoConfig();
+  const sceneIdx = scenes.findIndex((s) => frame >= s.startFrame && frame < s.endFrame);
   const scene = sceneIdx >= 0 ? scenes[sceneIdx] : null;
   if (!scene) return null;
-  const highlightList = highlightByScene.get(sceneIdx + 1) || []; // +1 because middle is scenes[1..-1]
 
-  // Default: distribute frames evenly across this scene. frame_NNNN.jpg indexing.
-  const sceneLen = scene.endFrame - scene.startFrame;
-  // We don't know the full frame count here — read from staticFile presence;
-  // the Composition just picks frame_${floor((frame-start)/sceneLen * N)}.jpg
-  // The N is set in spec.fps * spec.duration_seconds effectively, but we read it
-  // from a generated cue sheet. For simplicity, attempt sequential frame indexes
-  // starting at 1; the build copies all frames into public/frames/.
-  const relFrame = frame - scene.startFrame;
-  const idxWithinScene = Math.floor((relFrame / Math.max(sceneLen, 1)) * 100) + 1;
-  const filename = `frames/frame_${String(idxWithinScene).padStart(4, "0")}.jpg`;
-  const isHighlight = highlightList.some((h) => Math.abs(h.offset - relFrame) < fps);
-  const highlight = highlightList.find((h) => Math.abs(h.offset - relFrame) < fps);
+  // Map current composition frame to a source /watch frame index by walking
+  // the LLM's partition proportionally. Source frames live in [1, sourceFrameCount].
+  const firstStart = scenes[0].startFrame;
+  const lastEnd = scenes[scenes.length - 1].endFrame;
+  const span = Math.max(lastEnd - firstStart, 1);
+  const frac = (frame - firstStart) / span;
+  const srcFrame = Math.max(1, Math.min(sourceFrameCount, Math.round(1 + frac * (sourceFrameCount - 1))));
+  const filename = `frames/frame_${String(srcFrame).padStart(4, "0")}.jpg`;
+
+  const active = highlighted.find((h) => Math.abs(h.compFrame - frame) < fps);
+  const isHighlight = !!active;
 
   return (
     <AbsoluteFill>
@@ -635,7 +711,7 @@ const FramesBackdrop: React.FC<{
           transition: "transform 0.4s ease-out",
         }}
       />
-      {highlight ? (
+      {active ? (
         <div
           style={{
             position: "absolute",
@@ -650,7 +726,7 @@ const FramesBackdrop: React.FC<{
             borderRadius: 8,
           }}
         >
-          {highlight.caption}
+          {active.caption}
         </div>
       ) : null}
     </AbsoluteFill>
@@ -865,6 +941,11 @@ def scaffold(out_dir: Path, spec: dict, discovered: dict, title: str) -> None:
     """Write the full Remotion project tree to out_dir."""
     out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Source frame count lives alongside the LLM's spec — Composition.tsx
+    # needs it to map composition frames back to /watch frame indices when
+    # picking which JPEG to display.
+    spec["source_frame_count"] = discovered["frame_count"]
 
     slug = _slugify(title)
     composition_id = _composition_id(spec.get("title") or title)

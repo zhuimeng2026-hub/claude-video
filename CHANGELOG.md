@@ -2,6 +2,12 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.0] — 2026-08-19
+
+### Added
+- **`scripts/watch_to_remotion.py`** — deterministic `/watch` → Remotion converter. Parses the work directory's VTT cues, copies extracted frames (and original video when available), and scaffolds a runnable Remotion 4.x project (`Root.tsx`, `Composition.tsx`, `Subtitles.tsx`) that renders either an `OffthreadVideo` with burned-in subtitles or a frame slideshow. `public/cues.json` is the single source of truth — edit it to retime subtitles or swap modes without touching code. Honors `/watch`'s frame-dedup gaps by exporting actual sorted frame filenames in `framePaths`.
+- **`scripts/watch_to_remotion_smart.py`** — LLM-driven variant. Same input, but an LLM (OpenAI / Groq / LiteLLM, stdlib HTTP, no `pip install` needed) reads the transcript + frame count + duration and produces a structured JSON spec describing scenes, highlights, intro/outro copy, and subtitle styling. The resulting `Composition.tsx` is video-tailored rather than a fixed template. `--dry-run` prints the prompt and scaffolds a project from a `DEFAULT_SPEC` so the pipeline is testable without API credentials.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added
