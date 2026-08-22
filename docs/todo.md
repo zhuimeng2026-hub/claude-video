@@ -120,7 +120,7 @@
 #### 2.6.2 MCP 暴露 `recompose` tool
 
 - [ ] `mcp_server.py` 注册新 tool `recompose(video_id, pipeline, style="clean-professional", ...)`,内部通过 stdio 调 OpenMontage MCP server 的 `execute_tool` 提交项目
-  - `pipeline` 接受 `["clip-factory", "documentary-montage", "podcast-reproduce", "localization-dub", "hybrid"]` 中任一值(MVP 至少支持前两个,其余标 out-of-scope-本机)
+  - `pipeline` 接受 `["clip-factory", "documentary-montage", "podcast-repurpose", "localization-dub", "hybrid", "screen-demo"]` 中任一值(MVP 至少支持前两个,其余标 out-of-scope-本机)
   - **GPU-free 约束**:本机无 GPU,recompose tool 必须拒绝任何 GPU-only pipeline(FLUX / Kling / local_diffusion / hunyuan_video / wan_video / cogvideo_video),提交时校验 inputs.pipeline 不在禁止列表,否则 ToolError
 - [ ] `recompose` 返回 `{project_id, status: "submitted", render_url?}`,渲染产物由 OpenMontage 的 Backlot (`python -m backlot open <project-id>`) 跟踪
 - [ ] 进度通过 Phase 2.7 BFF 的 SSE 通道推送,事件 schema 复用 stage 字段(`stage: "submit" | "compose" | "render" | "done" | "error"`)
