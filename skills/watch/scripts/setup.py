@@ -36,7 +36,11 @@ from config import get_config  # noqa: E402
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
 # Optional Python packages. `mcp` powers the stdio MCP server (openclaw /
 # Claude Desktop). It's optional — /watch CLI works without it.
-OPTIONAL_PYTHON_PACKAGES = ["mcp>=1.0"]
+# Version range validated by tests/test_mcp_stdio_smoke.py — see
+# Phase 1.5 in docs/todo.md for why this exact range (Annotated[bytes,
+# Field(...)] return type works around the bare-bytes crash that hit
+# mcp>=1.20 + pydantic 2.10).
+OPTIONAL_PYTHON_PACKAGES = ["mcp>=1.20,<2.0"]
 CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
 ENV_TEMPLATE = """# /watch API configuration
@@ -89,6 +93,35 @@ def _missing_python_packages() -> list[str]:
         if importlib_util.find_spec(mod_name) is None:
             missing.append(spec)
     return missing
+
+
+def _check_mcp_server_compat() -> tuple[bool, str]:
+    """Try to import mcp_server.py under the current SDK.
+
+    Just because `import mcp` succeeds doesn't mean the server works —
+    FastMCP's `@mcp.resource` decorator wraps return types via
+    pydantic.create_model, which crashes on bare `bytes` under pydantic
+    2.10+. We fixed that with Annotated[bytes, Field(...)] (Phase 1.5),
+    but a future SDK regression could re-break it. This catches the
+    regression before the host launches the server.
+
+    Returns (ok, message).
+    """
+    if importlib_util.find_spec("mcp") is None:
+        return False, "mcp package not installed"
+    try:
+        import mcp_server  # noqa: F401 — needs sys.path entry to find it
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _ensure_scripts_on_path() -> None:
+    """Insert the scripts directory onto sys.path so `import mcp_server`
+    resolves the bundled copy rather than failing or picking up a
+    different `mcp_server` somewhere else on the path."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
 
 
 def _pip_install_user(spec: str) -> tuple[bool, str]:
@@ -277,6 +310,8 @@ def _status() -> dict:
 
     cfg = get_config()
     missing_py = _missing_python_packages()
+    _ensure_scripts_on_path()
+    mcp_server_ok, mcp_server_msg = _check_mcp_server_compat()
     return {
         "status": status,
         "can_proceed": can_proceed,
@@ -290,6 +325,8 @@ def _status() -> dict:
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
         "mcp_available": not missing_py,
+        "mcp_server_compat": mcp_server_ok,
+        "mcp_server_error": mcp_server_msg or None,
         "missing_python_packages": missing_py,
     }
 
@@ -373,6 +410,25 @@ def cmd_install() -> int:
         else:
             print(f"[setup] {msg} — the MCP server will not run until this is resolved; "
                   f"`/watch` CLI is unaffected.", file=sys.stderr)
+
+    # After install, verify mcp_server.py actually imports. A successful
+    # `pip install mcp` doesn't guarantee the server starts — Phase 1.5
+    # history: mcp==1.29.0 + pydantic 2.10 broke bare-`bytes` resource
+    # returns. We now use Annotated[bytes, Field(...)] so it works, but
+    # a future regression would silently break the MCP server at host
+    # launch. Catch it here.
+    _ensure_scripts_on_path()
+    mcp_server_ok, mcp_server_msg = _check_mcp_server_compat()
+    if not missing_py and not mcp_server_ok:
+        print(
+            f"[setup] WARNING: mcp installed but mcp_server.py fails to import: "
+            f"{mcp_server_msg}\n"
+            f"[setup]   The MCP server will not run until this is resolved; "
+            f"`/watch` CLI is unaffected.\n"
+            f"[setup]   If you just upgraded mcp, see Phase 1.5 in docs/todo.md — "
+            f"Annotated[bytes, Field(...)] may need a code update.",
+            file=sys.stderr,
+        )
 
     created = _scaffold_env()
     if created:

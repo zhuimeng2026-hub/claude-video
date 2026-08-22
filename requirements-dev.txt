@@ -1,0 +1,11 @@
+# Test-only dependencies. Installed via:
+#   pip install --user -r requirements-dev.txt
+#
+# Runtime deps live in requirements.txt.
+
+# Test runner
+pytest>=8.0
+
+# pytest plugins used in tests/
+pytest-anyio>=0.21      # async test support
+typeguard>=4.0          # runtime type checking in tests

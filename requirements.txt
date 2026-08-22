@@ -1,0 +1,23 @@
+# Runtime dependencies for /watch and the MCP server.
+#
+# Most scripts use only the Python stdlib. This file pins the third-party
+# packages introduced by the project, with the version range validated by
+# tests/test_mcp_stdio_smoke.py against the current `mcp` SDK.
+#
+# Install:
+#   pip install --user -r requirements.txt
+# Or let setup.py do it:
+#   python3 ${SKILL_DIR}/scripts/setup.py
+
+# MCP SDK — powers the stdio server in scripts/mcp_server.py.
+# Phase 1.5 (docs/todo.md) verified mcp==1.29.0 + pydantic 2.10 works
+# with the Annotated[bytes, Field(...)] return type on @mcp.resource.
+# Lower bound 1.20 catches any pre-bare-bytes-crash versions; upper
+# bound 2.0 reserves the right to update before a hypothetical major
+# release changes the resource decorator contract.
+mcp>=1.20,<2.0
+
+# yt-dlp — required for /watch CLI itself (URL → captions + video download).
+# No upper bound: yt-dlp ships minor versions frequently to keep up with
+# site extractor changes; pinning causes stale extractors.
+yt-dlp>=2024.1.1

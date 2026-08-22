@@ -155,15 +155,19 @@ For claude.ai, build the `.skill` bundle from source: `bash skills/watch/scripts
 For agents that speak the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, the skill ships a small MCP server that wraps `/watch` as one tool. Each extracted frame is also exposed as a readable `watch-frame://` resource so the agent can fetch raw JPEG / PNG bytes without going through the filesystem.
 
 ```bash
-# 1. Install the MCP SDK (the project's only third-party Python dep)
-pip install --user "mcp>=1.0"
+# 1. Install the MCP SDK (the project's only third-party Python dep).
+#    requirements.txt pins `mcp>=1.20,<2.0` — validated against
+#    mcp==1.29.0 + pydantic 2.10 in tests/test_mcp_stdio_smoke.py.
+pip install --user -r requirements.txt
 # or let `python3 ${SKILL_DIR}/scripts/setup.py` install it for you on first run.
 
 # 2. Register the server in your host config. Path is the absolute path
 #    to scripts/mcp_server.py inside the installed skill folder.
 ```
 
-**openclaw / Claude Desktop / Continue / Zed** — same JSON shape (`mcpServers`):
+#### Hosted hosts (openclaw / Claude Desktop / Continue / Zed)
+
+Same JSON shape (`mcpServers`):
 
 ```json
 {
@@ -187,6 +191,63 @@ pip install --user "mcp>=1.0"
   }
 }
 ```
+
+#### Lightweight clients (no openclaw / Claude Desktop required)
+
+The server is plain stdio JSON-RPC 2.0 — any MCP 2024-11-05 client can drive it. The protocol layer is verified by `tests/test_mcp_stdio_smoke.py` (N=8 concurrent subprocesses, no cross-process session leakage).
+
+**MCP Inspector** (npm, no installation beyond Node):
+
+```bash
+npx @modelcontextprotocol/inspector python3 /absolute/path/to/skills/watch/scripts/mcp_server.py
+```
+
+Opens a web UI showing `tools/list`, `resources/list`, and lets you call them interactively. Good for sanity-checking the server works in your env before wiring it into a host.
+
+**Custom Python stdio client** (10 lines, no framework needed):
+
+```python
+import asyncio, json, sys
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def main():
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["/absolute/path/to/skills/watch/scripts/mcp_server.py"],
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("watch", {
+                "source": "https://youtu.be/dQw4w9WgXcQ",
+                "no_whisper": True,
+            })
+            print(json.loads(result.content[0].text)["report"][:200])
+
+asyncio.run(main())
+```
+
+**Custom Node.js stdio client**:
+
+```js
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const transport = new StdioClientTransport({
+  command: "python3",
+  args: ["/absolute/path/to/skills/watch/scripts/mcp_server.py"],
+});
+const client = new Client({ name: "my-agent", version: "0.1.0" }, { capabilities: {} });
+await client.connect(transport);
+const { tools } = await client.listTools();
+const { content } = await client.callTool({ name: "watch", arguments: {
+  source: "https://youtu.be/dQw4w9WgXcQ", no_whisper: true,
+}});
+console.log(JSON.parse(content[0].text).report.slice(0, 200));
+```
+
+Verified compatible clients are tracked in [`docs/MCP_CLIENT_COMPAT.md`](docs/MCP_CLIENT_COMPAT.md).
 
 The server exposes one tool (`watch`) and two resource templates:
 
