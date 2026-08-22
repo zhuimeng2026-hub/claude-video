@@ -35,6 +35,10 @@ The skill is a self-contained folder: `skills/watch/`. Everything the skill need
 - `skills/watch/scripts/frames.py` — ffmpeg frame extraction with auto-fps, scene/keyframe detection, and dedup
 - `skills/watch/scripts/transcribe.py` — VTT subtitle parsing and Whisper orchestration
 - `skills/watch/scripts/whisper.py` — Groq and OpenAI Whisper API clients (pure stdlib, no deps)
+- `skills/watch/scripts/segment.py` — SAM 2 video segmentation via Replicate (`--segment` flag); uploads video, polls predictions, downloads mask frames
+- `skills/watch/scripts/watch_to_remotion.py` — deterministic `/watch` → Remotion 4.x project converter (VTT → cues.json, frames + optional video → renderable Composition)
+- `skills/watch/scripts/watch_to_remotion_smart.py` — LLM-driven variant that tailors the Remotion composition to the video (OpenAI / Groq / LiteLLM, stdlib HTTP)
+- `skills/watch/scripts/mcp_server.py` — stdio MCP server wrapping the same CLI flags as `watch.py`; exposes the `watch` tool and registers each extracted frame as a `watch-frame://<sid>/frames/<file>` resource (image/jpeg) and mask as `watch-frame://<sid>/masks/<file>` (image/png). Path-traversal defence via `Path.is_relative_to(work_dir)`.
 - `skills/watch/scripts/config.py` — shared config from `~/.config/watch/.env`
 - `skills/watch/scripts/setup.py` — preflight check and first-run installer
 

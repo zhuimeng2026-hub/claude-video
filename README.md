@@ -150,6 +150,53 @@ ln -s "$(pwd)/claude-video/skills/watch" ~/.claude/skills/watch   # or ~/.codex/
 
 For claude.ai, build the `.skill` bundle from source: `bash skills/watch/scripts/build-skill.sh` produces `dist/watch.skill`.
 
+### MCP server (openclaw, Claude Desktop, custom stdio agents)
+
+For agents that speak the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, the skill ships a small MCP server that wraps `/watch` as one tool. Each extracted frame is also exposed as a readable `watch-frame://` resource so the agent can fetch raw JPEG / PNG bytes without going through the filesystem.
+
+```bash
+# 1. Install the MCP SDK (the project's only third-party Python dep)
+pip install --user "mcp>=1.0"
+# or let `python3 ${SKILL_DIR}/scripts/setup.py` install it for you on first run.
+
+# 2. Register the server in your host config. Path is the absolute path
+#    to scripts/mcp_server.py inside the installed skill folder.
+```
+
+**openclaw / Claude Desktop / Continue / Zed** — same JSON shape (`mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "claude-video": {
+      "command": "python3",
+      "args": ["/absolute/path/to/skills/watch/scripts/mcp_server.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+**openclaw `mcporter.json`** variant:
+
+```json
+{
+  "claude-video": {
+    "command": "python3",
+    "args": ["/absolute/path/to/skills/watch/scripts/mcp_server.py"]
+  }
+}
+```
+
+The server exposes one tool (`watch`) and two resource templates:
+
+- `watch-frame://<session_id>/frames/<filename>` — JPEG bytes from the extracted frames
+- `watch-frame://<session_id>/masks/<filename>` — PNG bytes from SAM 2 segmentation masks (when `--segment` is used)
+
+`session_id` comes back from the `watch` tool call; the host then `resources/read` any URI it needs. Path traversal in the filename is rejected. The full interface contract — every flag, every return field, error modes — lives in [`docs/MCP_SERVER_PRD.md`](docs/MCP_SERVER_PRD.md).
+
+The MCP server is **excluded from the claude.ai `.skill` bundle** via `skills/watch/.skillignore` — claude.ai's sandboxed runtime doesn't host stdio MCP servers. It still ships via `npx skills add` for Codex, Cursor, and openclaw local agents.
+
 ## First run
 
 On the first `/watch` call, the skill runs `scripts/setup.py --check`. If `ffmpeg` / `yt-dlp` aren't on your PATH, or no Whisper API key is set, it walks you through fixing it:

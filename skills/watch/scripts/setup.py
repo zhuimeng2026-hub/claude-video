@@ -24,6 +24,7 @@ import platform
 import shutil
 import subprocess
 import sys
+from importlib import util as importlib_util
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -33,6 +34,9 @@ from config import get_config  # noqa: E402
 
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
+# Optional Python packages. `mcp` powers the stdio MCP server (openclaw /
+# Claude Desktop). It's optional — /watch CLI works without it.
+OPTIONAL_PYTHON_PACKAGES = ["mcp>=1.0"]
 CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
 ENV_TEMPLATE = """# /watch API configuration
@@ -71,6 +75,30 @@ def _which(name: str) -> str | None:
 
 def _check_binaries() -> list[str]:
     return [b for b in REQUIRED_BINARIES if not _which(b)]
+
+
+def _missing_python_packages() -> list[str]:
+    """Return OPTIONAL_PYTHON_PACKAGES that are not importable.
+
+    `mcp` is the MCP SDK; missing it only blocks the stdio MCP server
+    (`scripts/mcp_server.py`), not the /watch CLI.
+    """
+    missing: list[str] = []
+    for spec in OPTIONAL_PYTHON_PACKAGES:
+        mod_name = spec.split(">=")[0].split("==")[0].split("<")[0].strip()
+        if importlib_util.find_spec(mod_name) is None:
+            missing.append(spec)
+    return missing
+
+
+def _pip_install_user(spec: str) -> tuple[bool, str]:
+    """`pip install --user <spec>`. Quiet on success, stderr on failure."""
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "--quiet", spec]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return True, f"installed {spec}"
+    msg = (result.stderr or result.stdout or "").strip().splitlines()[-1] if (result.stderr or result.stdout) else "unknown"
+    return False, f"pip install {spec} failed: {msg}"
 
 
 _PERM_WARNED: set[str] = set()
@@ -248,6 +276,7 @@ def _status() -> dict:
     can_proceed = (not missing) and (has_key or setup_complete)
 
     cfg = get_config()
+    missing_py = _missing_python_packages()
     return {
         "status": status,
         "can_proceed": can_proceed,
@@ -260,6 +289,8 @@ def _status() -> dict:
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
+        "mcp_available": not missing_py,
+        "missing_python_packages": missing_py,
     }
 
 
@@ -331,6 +362,17 @@ def cmd_install() -> int:
             print(f"[setup] unsupported platform ({system}) for auto-install. Install manually:", file=sys.stderr)
             print(f"  missing: {', '.join(missing)}", file=sys.stderr)
             return 2
+
+    # Optional Python packages — installed silently. /watch CLI works without
+    # these; only the MCP server (mcp_server.py) needs `mcp`.
+    for spec in _missing_python_packages():
+        print(f"[setup] installing optional Python dep: {spec}", file=sys.stderr)
+        ok, msg = _pip_install_user(spec)
+        if ok:
+            print(f"[setup] {msg}", file=sys.stderr)
+        else:
+            print(f"[setup] {msg} — the MCP server will not run until this is resolved; "
+                  f"`/watch` CLI is unaffected.", file=sys.stderr)
 
     created = _scaffold_env()
     if created:
