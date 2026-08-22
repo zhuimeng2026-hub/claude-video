@@ -1,0 +1,14 @@
+{
+  "_comment": "Error envelope for `recompose` when copying watch artifacts (frames, video, VTT) into the OpenMontage project dir at `projects/users/<user_openid>/<project_id>/assets/` fails. Distinct from `pipeline_stage_failed` (which fires later, when OM's pipeline itself errors during composition/render). See docs/MCP_SERVER_PRD.md §2.6.",
+
+  "code": "assets_copy_failed",
+  "message": "failed to copy watch artifacts to projects/users/oXyzExampleWeChatOpenId/abc123def456/assets/: [Errno 28] No space left on device. Source: /home/example/.cache/watch-mcp/b9f3c1a27e58/.",
+
+  "_example_caller_context": {
+    "video_id": "b9f3c1a27e58",
+    "pipeline": "clip-factory",
+    "style": "clean-professional",
+    "user_openid": "oXyzExampleWeChatOpenId",
+    "project_id": "abc123def456"
+  }
+}

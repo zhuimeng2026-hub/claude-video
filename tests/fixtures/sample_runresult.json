@@ -1,0 +1,32 @@
+{
+  "_comment": "Canonical example of the `RunResult` shape that OpenMontage's adapter (`tools/external/claude_video.py`) consumes. Matches the field set requested in docs/openmontage-integration-inputs.md §1 and mirrored in docs/MCP_SERVER_PRD.md §2.6. Tests in both repos pin against this file rather than re-derive the schema from MCP tool calls. The mp4 used as the source is a 10s Big Buck Bunny clip (public domain) — small enough to commit the *result shape* without committing the media itself.",
+
+  "video_id": "b9f3c1a27e58",
+  "frames_dir": "/home/example/.cache/watch-mcp/b9f3c1a27e58/frames/",
+  "masks_dir": null,
+  "vtt_path": "/home/example/.cache/watch-mcp/b9f3c1a27e58/transcript.en.vtt",
+  "video_path": "/home/example/.cache/watch-mcp/b9f3c1a27e58/source.mp4",
+  "duration_seconds": 10.04,
+
+  "transcript_segments": [
+    {"start": 0.00, "end": 2.84, "text": "Big Buck Bunny is short animated film by the Blender Foundation."},
+    {"start": 2.84, "end": 5.92, "text": "It is made using free and open source software."},
+    {"start": 5.92, "end": 8.40, "text": "It stars a large rabbit with a heart bigger than himself."},
+    {"start": 8.40, "end": 10.04, "text": "The film is released under the Creative Commons Attribution license."}
+  ],
+
+  "_recompose_return_envelope_example": {
+    "_comment": "When `recompose` is called with this video_id, it returns the same inputs above plus project metadata. Shown here for documentation; tests should not depend on `project_id`/`render_url` being deterministic across runs.",
+    "video_id": "b9f3c1a27e58",
+    "frames_dir": "/home/example/.cache/watch-mcp/b9f3c1a27e58/frames/",
+    "masks_dir": null,
+    "vtt_path": "/home/example/.cache/watch-mcp/b9f3c1a27e58/transcript.en.vtt",
+    "video_path": "/home/example/.cache/watch-mcp/b9f3c1a27e58/source.mp4",
+    "duration_seconds": 10.04,
+    "transcript_segments": "<<see top-level: same array>>",
+    "project_id": "abc123def456",
+    "status": "submitted",
+    "render_url": "https://example.com/renders/abc123def456/final.mp4",
+    "backlot_url": "http://localhost:8900/backlot/abc123def456"
+  }
+}

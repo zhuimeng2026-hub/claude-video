@@ -1,0 +1,13 @@
+{
+  "_comment": "Error envelope for `recompose` when `video_id` is not in session_store.py — either never created, expired, or never run through `watch` on this server. See docs/MCP_SERVER_PRD.md §2.6.",
+
+  "code": "video_id_unknown",
+  "message": "video_id 'unknown_or_expired_xyz' is not in session_store. Run the `watch` tool first to create the session, or pass a video_id that exists on this server.",
+
+  "_example_caller_context": {
+    "video_id": "unknown_or_expired_xyz",
+    "pipeline": "clip-factory",
+    "style": "clean-professional",
+    "user_openid": null
+  }
+}

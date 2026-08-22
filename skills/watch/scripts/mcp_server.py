@@ -25,7 +25,9 @@ import base64
 import sys
 import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
+
+from pydantic import Field
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -162,7 +164,10 @@ def watch(
         "Path traversal in {filename} is rejected."
     ),
 )
-def read_frame(session_id: str, filename: str) -> bytes:
+def read_frame(
+    session_id: str,
+    filename: str,
+) -> Annotated[bytes, Field(description="Raw JPEG bytes for the requested frame.")]:
     """Read a video frame (JPEG) by URI.
 
     The {session_id} is the value returned by the `watch` tool. Hosts
@@ -171,6 +176,12 @@ def read_frame(session_id: str, filename: str) -> bytes:
     Path-traversal defence: the resolved file path is asserted to be a
     descendant of the session's frames/ subdirectory before bytes are
     returned.
+
+    NOTE: return type is wrapped in `Annotated[bytes, Field(...)]`
+    because FastMCP's `@mcp.resource` decorator introspects the function
+    signature through pydantic.create_model, and bare `bytes` raises
+    `PydanticUserError` under pydantic 2.10+. See Phase 1.5 in
+    `docs/todo.md`.
     """
     return _read_artifact(session_id, filename, subdir="frames")
 
@@ -185,8 +196,15 @@ def read_frame(session_id: str, filename: str) -> bytes:
         "as the frames resource."
     ),
 )
-def read_mask(session_id: str, filename: str) -> bytes:
-    """Read a SAM 2 segmentation mask (PNG) by URI."""
+def read_mask(
+    session_id: str,
+    filename: str,
+) -> Annotated[bytes, Field(description="Raw PNG bytes for the requested segmentation mask.")]:
+    """Read a SAM 2 segmentation mask (PNG) by URI.
+
+    See `read_frame` for the `Annotated[bytes, Field(...)]` rationale
+    (Phase 1.5).
+    """
     return _read_artifact(session_id, filename, subdir="masks")
 
 

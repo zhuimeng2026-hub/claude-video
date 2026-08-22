@@ -1,0 +1,13 @@
+{
+  "_comment": "Error envelope for `recompose` when `pipeline` is not in the whitelist. Maps to MCP `ToolError` with a stable `code` field. See docs/MCP_SERVER_PRD.md §2.6 and docs/openmontage-integration-inputs.md §2 for the full table — these names must stay 1:1 in sync with OpenMontage's claude-video-integration.md §4.4.",
+
+  "code": "pipeline_not_in_whitelist",
+  "message": "pipeline 'flux-style-transfer' is not in the allowed whitelist. Allowed: ['clip-factory', 'documentary-montage', 'podcast-repurpose', 'localization-dub', 'hybrid', 'screen-demo'].",
+
+  "_example_caller_context": {
+    "video_id": "b9f3c1a27e58",
+    "pipeline": "flux-style-transfer",
+    "style": null,
+    "user_openid": "oXyzExampleWeChatOpenId"
+  }
+}

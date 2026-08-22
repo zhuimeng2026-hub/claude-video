@@ -11,6 +11,14 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+# Make the `claude_video` shim package importable too, so tests can exercise
+# the same import path external projects (e.g. OpenMontage's adapter tests)
+# will use. The shim re-exports from `skills/watch/scripts/` after adding
+# it to sys.path, so the entry above is what actually drives imports — this
+# one just makes the package resolvable. See
+# docs/openmontage-integration-inputs.md §6.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [
     "red", "green", "blue", "white", "black", "yellow", "cyan",

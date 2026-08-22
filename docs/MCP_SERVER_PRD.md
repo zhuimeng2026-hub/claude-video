@@ -127,6 +127,129 @@ The server returns MCP error results (not Python tracebacks) for:
 | Path traversal in filename component | `resources/read` returns `Invalid URI` error. (Defence-in-depth: resolver forces `Path.is_relative_to(work_dir)`.) |
 | `mcp` Python package not installed | Server fails at startup with `ModuleNotFoundError`. Host should pre-install via `pip install --user mcp>=1.0` or rely on `setup.py` auto-install. |
 
+### 2.6 The `recompose` tool (Phase 2.6.2 — not yet implemented)
+
+> **Status**: This section describes the **target contract** that the
+> `recompose` MCP tool must implement, as agreed with the OpenMontage
+> integration. The tool does not exist in `mcp_server.py` yet; the
+> implementation lands as part of `docs/todo.md` §2.6.2. Until then,
+> callers needing recomposition should reach the OM adapter through
+> the BFF (Phase 2.7, `docs/BFF_API_CONTRACT.md`) once it ships.
+
+The `recompose` tool takes the artifacts produced by an earlier
+`watch` call and submits them to OpenMontage's
+`tools/external/claude_video.py` adapter for composition + render. It
+is the **only** path from `/watch` output to a rendered video in v2+
+— direct `npx remotion render` and `ffmpeg` render invocations are
+banned by `docs/todo.md` §2.6.
+
+#### 2.6.1 Signature
+
+```python
+recompose(
+    video_id: str,                                                                  # required; must exist in session_store
+    pipeline: "clip-factory" | "documentary-montage" | "podcast-repurpose" |
+              "localization-dub" | "hybrid" | "screen-demo",                         # required; whitelist enforced
+    style: str = "clean-professional",                                                # optional; OM playbook name
+    user_openid: str | None = None,                                                   # optional; BFF overrides with cookie-bound value
+    extra: dict = {},                                                                 # optional; transparent passthrough to OM ClaudeVideoInputs.extra
+) -> dict
+```
+
+The `pipeline` whitelist is the exact set OpenMontage accepts; the
+mapping lives in [`docs/OPENMONTAGE_NAME_MAP.md`](OPENMONTAGE_NAME_MAP.md).
+Any value outside the whitelist returns
+`pipeline_not_in_whitelist` (see §2.6.3).
+
+#### 2.6.2 Return shape
+
+`recompose` returns the same set of fields the OM adapter consumes
+(`ClaudeVideoInputs.source` in their integration spec), **plus** the
+project metadata that OM returns after submission:
+
+```json
+{
+  "video_id": "b9f3c1a27e58",
+  "frames_dir": "/home/user/.cache/watch-mcp/b9f3c1a27e58/frames/",
+  "masks_dir":  "/home/user/.cache/watch-mcp/b9f3c1a27e58/masks/",
+  "vtt_path":   "/home/user/.cache/watch-mcp/b9f3c1a27e58/transcript.en.vtt",
+  "video_path": "/home/user/.cache/watch-mcp/b9f3c1a27e58/source.mp4",
+  "duration_seconds": 137.42,
+  "transcript_segments": [
+    {"start": 0.00, "end": 2.84, "text": "Big Buck Bunny is a short animated film..."},
+    {"start": 2.84, "end": 5.92, "text": "..."}
+  ],
+
+  "project_id": "abc123def456",
+  "status": "submitted",
+  "render_url": "https://example.com/renders/abc123def456/final.mp4",
+  "backlot_url": "http://localhost:8900/backlot/abc123def456"
+}
+```
+
+**Field derivation** (from session_store + watch artifacts):
+
+| Field | Source |
+|---|---|
+| `video_id` | Input argument (echoed back). |
+| `frames_dir` | `session_store[video_id]["work_dir"] + "/frames"` — guaranteed to exist if the `watch` run succeeded. |
+| `masks_dir` | Same prefix + `"/masks"` — `None` if `--segment` was not used (the OM adapter treats `None` as "no masks to copy"). |
+| `vtt_path` | Same prefix + `/transcript.<lang>.vtt` — derived from the language of the caption track used; `None` if no captions and no Whisper run. |
+| `video_path` | Same prefix + `/source.mp4` — the file yt-dlp downloaded; `None` if the source was already a local path that the caller moved. |
+| `duration_seconds` | `ffprobe -show_entries format=duration -of csv=p=0 <video_path>` — probed lazily at recompose time, cached on first read. |
+| `transcript_segments` | Parsed from `vtt_path` via the existing `transcribe.parse_vtt()` helper — same data structure `watch.py` already uses internally. |
+
+A canonical example of this shape lives at
+[`tests/fixtures/sample_runresult.json`](../tests/fixtures/sample_runresult.json);
+tests in both repos pin against that fixture rather than re-deriving
+the schema from MCP tool calls.
+
+The `watch` tool's return shape is **NOT** changed by this section —
+it keeps its current `report` / `session_id` / `work_dir` / `frame_uris` /
+`frame_count` / `transcript_source` fields. `recompose` is a separate
+tool that re-derives the structured inputs from session storage.
+
+#### 2.6.3 Error envelope (ToolError codes)
+
+When `recompose` fails, the tool raises an MCP `ToolError` whose
+`message` field carries a stable, machine-readable code in square
+brackets. These codes MUST stay 1:1 with OpenMontage's
+`claude-video-integration.md` §4.4; both sides' error tables are
+generated from the same source-of-truth list.
+
+| `code` (in `[brackets]` after the message) | HTTP status (BFF) | Trigger |
+|---|---|---|
+| `pipeline_not_in_whitelist` | 422 | `pipeline` is not in the whitelist from `docs/OPENMONTAGE_NAME_MAP.md`. Error message lists the allowed values. |
+| `video_id_unknown` | 404 | `video_id` is not in `session_store` — either never created by `watch`, expired by cleanup, or belongs to a different BFF instance. |
+| `user_not_found` | 403 | `user_openid` was required (BFF passed an empty value, or session is anonymous in a deploy that disallows it). |
+| `assets_copy_failed` | 422 | `cp -r <work_dir>/{frames,masks,*.vtt,source.mp4} <projects/users/<user_openid>/<project_id>/assets/>` returned non-zero (disk full, permission denied, missing source file). Distinct from `pipeline_stage_failed` (which fires later, during OM-side composition/render). |
+| `pipeline_stage_failed` | 422 | OM reported a failure in any of `submit`, `compose`, `render`. The OM error message is preserved in the `message` field after the `[pipeline_stage_failed]` prefix. |
+| `gpu_required` | 422 | `pipeline` would need a GPU provider (`FLUX`, `Kling`, `local_diffusion`, `hunyuan_video`, `wan_video`, `cogvideo_video`) on this no-GPU host. This is a hard ban — see `docs/todo.md` §2.6 "GPU-free 约束". |
+
+A canonical example envelope per code is in
+[`tests/fixtures/`](../tests/fixtures/):
+
+- `error_envelope_pipeline_not_in_whitelist.json`
+- `error_envelope_video_id_unknown.json`
+- `error_envelope_assets_copy_failed.json`
+
+(The remaining three — `user_not_found`, `pipeline_stage_failed`,
+`gpu_required` — are planned but not yet committed as fixtures.)
+
+#### 2.6.4 Authorization contract
+
+`recompose` enforces the second-line checks described in
+[`docs/OAUTH_TRUST_MODEL.md`](OAUTH_TRUST_MODEL.md):
+
+1. `video_id` must exist in `session_store` (Phase 2.1 introduces persistent session storage).
+2. `session_store[video_id]["user_openid"]` must equal the `user_openid` parameter passed to `recompose`. Mismatch → `user_not_found` (or a tighter `video_id_user_mismatch` code — see `docs/OAUTH_TRUST_MODEL.md` §MCP tool layer).
+
+The BFF is expected to silently override any `user_openid` sent in
+HTTP request bodies with the cookie-bound value, so this check is
+typically a no-op in normal operation. It exists so that an MCP
+caller without BFF protection (e.g. a custom stdio client) cannot
+recompose someone else's session.
+
 ---
 
 ## 3. Configuration & Installation
