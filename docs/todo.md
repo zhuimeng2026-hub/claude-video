@@ -56,7 +56,8 @@
 - [ ] 新增 `skills/watch/scripts/session_store.py`:把 `SESSIONS` dict 从内存搬到 `~/.cache/watch-mcp/sessions.json`(atomic write,模式 `0600`)
 - [ ] `video_id` 参数加进 `watch` tool:`video_id: str | None = None`(不传则用 URL hash 的 12 字符)
 - [ ] 同 `video_id` 二次调用:默认**复用**已有 work_dir(只重跑请求的阶段,如 `--segment` 增量);可显式 `--restart` 强制重跑
-- [ ] 提供 `list_sessions` / `delete_session` 两个新 MCP tool,让外部可以清理磁盘
+- [ ] **微信用户占位字段(预留,本期不接 OAuth 流)**:每条 session 记录带 `user_openid: str | None`、`user_unionid: str | None`、`auth_source: Literal["wechat_mp","wechat_op","none"]`;MCP tool 接受可选 `user_openid` 参数,先**只存不验**,等 2.7 接入正式 OAuth 流时再校验
+- [ ] 提供 `list_sessions` / `delete_session` 两个新 MCP tool,让外部可以清理磁盘;这两个 tool **必须**校验调用方传入的 `user_openid` 与 session 记录的 `user_openid` 匹配,默认拒绝跨用户访问(同 2.7 的隔离模型)
 
 ### 2.2 拆分 pipeline 为多个 MCP tool
 
@@ -74,19 +75,14 @@
 - [ ] `session_store.py` 增加 `stage` 字段(`"download" | "frames" | "transcribe" | "segment" | "done" | "error" | "cancelled"`)和 `progress: float`
 - [ ] 后台线程在每个关键点更新 stage/progress;`get_status` 直接读 store,无锁(`json` 读写互斥即可)
 
-### 2.3 进度推送 — 两种传输都给
+### 2.3 进度推送 — stdio notifications(浏览器走 Phase 2.7 SSE)
 
-**stdio MCP 客户端**(Claude Desktop 之类):用 MCP `notifications/progress` 标准协议
+**stdio MCP 客户端**(Claude Desktop / WorkBuddy / 任意 stdio):用 MCP `notifications/progress` 标准协议
 
 - [ ] `start_watch` 调用方拿到 `progressToken`,后台线程在每个阶段结束发 `notifications/progress` with `{progressToken, progress, message}`
 - [ ] 进度事件 schema:`{stage, progress, message, ts}`
 
-**Web / 非 MCP 客户端**:WebSocket 端点
-
-- [ ] `mcp_server.py` 增加 `mcp.run_streamable_http_async()` 入口,但**默认还是 stdio**(保持 Phase 1 兼容)
-- [ ] 新增 `skills/watch/scripts/ws_progress.py`:独立进程,监听 `ws://localhost:<port>/progress/<video_id>`
-- [ ] 进度事件由 session_store 同步推送:用 `asyncio.Queue` 桥接后台 watch 线程的写、ws handler 的读
-- [ ] 鉴权:MVP 阶段用 `WATCH_WS_TOKEN` env var(从 `~/.config/watch/.env` 读),客户端连接时在 query string 或 header 携带
+**浏览器客户端**:**不**走裸 WebSocket(MCP 长连接 + CORS 不适合浏览器,详见 OpenMontage `openmontage-integration.md:53-58` 的论证)。走 Phase 2.7 BFF 的 SSE 端点。
 
 ### 2.4 外部 web 服务场景的具体接口
 
@@ -94,11 +90,12 @@
 
 **路径 1(不做)**:纯 HTTP/REST web service,与 MCP 平行。重复造轮子。
 
-**路径 2(MVP 选这个)**:外部 web 服务作为 MCP 客户端,通过 stdio 调 `start_watch` / `get_status` / `read_frame`。**用户感觉像 REST,但底层是 MCP**。
+**路径 2(MVP 选这个)**:Phase 2.7 BFF 把 REST/SSE 翻译成 stdio MCP。**用户感觉像 REST,底层是 MCP。**
 
 - [ ] 在 `docs/MCP_CLIENT_COMPAT.md` 加一节:"Node.js web 服务接入示例",用官方 `@modelcontextprotocol/sdk` 的 `StdioClientTransport`,10 行代码示例
 - [ ] 加一节"Python web 服务示例",用 `mcp.client.session.stdio`
-- [ ] 明确告诉用户:stdio 一个进程跑一个 web 服务,扩展时再换 HTTP transport
+- [ ] 加一节"浏览器接入示例":`fetch('/api/watch/start', ...)` + `new EventSource('/api/watch/{video_id}/events')`,展示 SSE 自动重连
+- [ ] 明确告诉用户:stdio 一个进程跑一个 web 服务,BFF 跑在另一进程;扩展时 BFF 可换成 `mcp.run_streamable_http_async()` 端点但默认不开
 
 ### 2.5 取消与超时
 
@@ -122,14 +119,68 @@
 
 #### 2.6.2 MCP 暴露 `recompose` tool
 
-- [ ] `mcp_server.py` 注册新 tool `recompose(video_id, pipeline="clip-factory", style="clean-professional", ...)`,内部通过 stdio 调 OpenMontage MCP server 的 `execute_tool` 提交项目
+- [ ] `mcp_server.py` 注册新 tool `recompose(video_id, pipeline, style="clean-professional", ...)`,内部通过 stdio 调 OpenMontage MCP server 的 `execute_tool` 提交项目
+  - `pipeline` 接受 `["clip-factory", "documentary-montage", "podcast-reproduce", "localization-dub", "hybrid"]` 中任一值(MVP 至少支持前两个,其余标 out-of-scope-本机)
+  - **GPU-free 约束**:本机无 GPU,recompose tool 必须拒绝任何 GPU-only pipeline(FLUX / Kling / local_diffusion / hunyuan_video / wan_video / cogvideo_video),提交时校验 inputs.pipeline 不在禁止列表,否则 ToolError
 - [ ] `recompose` 返回 `{project_id, status: "submitted", render_url?}`,渲染产物由 OpenMontage 的 Backlot (`python -m backlot open <project-id>`) 跟踪
-- [ ] 进度通过 Phase 2.3 的 WebSocket 通道推送,事件 schema 复用 stage 字段(`stage: "submit" | "compose" | "render" | "done" | "error"`)
+- [ ] 进度通过 Phase 2.7 BFF 的 SSE 通道推送,事件 schema 复用 stage 字段(`stage: "submit" | "compose" | "render" | "done" | "error"`)
+- [ ] 调用方传入的 `user_openid` 必须随 inputs 一起透传给 OpenMontage adapter(由那边落到 `projects/users/<user_openid>/`)
 
 #### 2.6.3 OpenMontage 侧的对接约定
 
-- [ ] 在 `OpenMontage_Voicebox/tools/video/`(或新建 `tools/external/claude_video.py`)加一个 adapter tool,接受 `{frames_dir, vtt_path, video_path, style, pipeline}`;把 watch 产物符号链接/拷贝到 `projects/<project-id>/assets/`,触发对应 pipeline
-- [ ] 这部分改动落在 OpenMontage 仓库,不在本仓库 scope——但要在 `docs/todo.md` 留 cross-repo 链接,等那边有 owner 后跟踪
+- [ ] **本仓库只写文档**:在 `OpenMontage_Voicebox/docs/claude-video-integration.md` 写完整的跨仓集成文档(模板参考同仓 `comfyui-adapter-plan.md` 的结构:背景 / 架构图 / 集成模型 / 数据流 / 配置 / 测试)。文档要列清楚:
+  - claude-video 侧 product context(产物结构、video_id 语义、user_openid 透传约定)
+  - OpenMontage 侧需要做的代码改动清单(新增 `tools/external/claude_video.py` BaseTool,签名、inputs schema、产物落点)
+  - GPU-free pipeline 白名单 + 黑名单
+  - 用户隔离约定(与 `web-multiuser-auth.md` 的 `projects/users/<user_id>/` 模型对齐)
+  - 微信服务号 OAuth 复用建议
+  - 端到端冒烟测试脚本框架
+  - 末尾留 issue list 给 OpenMontage owner 接手
+- [ ] 这部分**实际代码改动**落在 OpenMontage 仓库,不在本仓库 scope;等那边 owner 实施后,本仓库 recompose tool 的 ToolError 信息要更新成新 adapter tool name
+
+### 2.7 BFF (FastAPI REST + SSE) 给浏览器客户端 (MVP,目标 ~2 天)
+
+**为什么不直接 WebSocket**:MCP 长连接 + CORS 不适合浏览器(参考 OpenMontage `openmontage-integration.md:53-58`)。OpenMontage 自家的做法是 Go BFF(`frameflow/bff/`)把 REST 转 MCP JSON-RPC,我们 Python 侧用 FastAPI 复制同样的模式。
+
+- [ ] 新增 `skills/watch/scripts/bff.py`:FastAPI app,单进程
+  - `POST /api/watch/start` body `{source, video_id?, user_openid?}` → 内部 spawn stdio MCP 客户端调 `start_watch`,返回 `{video_id, status: "running"}`
+  - `GET  /api/watch/{video_id}/status` → 内部调 `get_status`,透传返回
+  - `GET  /api/watch/{video_id}/frame/{filename}` → 内部调 `read_frame`,字节流回
+  - `GET  /api/watch/{video_id}/mask/{filename}` → 同上
+  - `GET  /api/watch/{video_id}/events` → **SSE**,内部订阅 MCP `notifications/progress` 并转发为 `data: {json}\n\n`
+  - `POST /api/watch/{video_id}/cancel` → 调 `cancel_watch`
+  - `POST /api/recompose` body `{video_id, pipeline, style?, user_openid?}` → 调 `recompose`
+- [ ] **stdio MCP 子进程管理**:BFF 启动时 spawn `python3 mcp_server.py`,持久化一个 stdio 会话,所有 tool call 通过 `mcp.client.session.stdio` 复用同一连接(JSON-RPC over stdio 是有状态的,不能每次新建)。或者用进程内 asyncio queue 串行化请求。
+- [ ] **CORS**:默认只允许 `http://localhost:*` + `tauri://`(与 OpenMontage 一致),通过 env `WATCH_BFF_CORS_ORIGINS` 覆盖
+- [ ] **鉴权**:所有 `/api/*` 路由挂 `Depends(require_user)`(由 2.8 提供);未登录返回 `401 {error: "not_authenticated"}`,前端跳 `/auth/wechat`
+- [ ] **端口**:默认 `WATCH_BFF_PORT=8910`;与 OpenMontage 的 8900 区分;启动失败时明确报端口占用,不打印 traceback
+- [ ] 测试 `tests/test_bff.py`:用 `httpx.AsyncClient + ASGITransport` 跑全流程,断言 SSE 事件流含 `stage=download` / `frames` / `transcribe` / `done` 的 progression
+
+### 2.8 微信服务号 OAuth 流接入 session store (MVP,目标 ~1 天)
+
+**复用 OpenMontage 现有方案**:见 `OpenMontage_Voicebox/docs/doc-wechat-open-platform-oauth.md`(实际采用服务号方案)+ `web-multiuser-auth.md`(用户隔离模型)。本仓库单独走一遍,而不是依赖 OpenMontage 的 OAuth,因为我们 MVP 阶段要让本仓库独立可跑。
+
+- [ ] **配置**(从 `~/.config/watch/.env` 读,与现有 config.py 集成):
+  ```dotenv
+  WECHAT_MP_APP_ID=服务号 AppID
+  WECHAT_MP_APP_SECRET=服务号 AppSecret
+  WECHAT_MP_REDIRECT_URI=https://your-domain/auth/wechat/callback
+  WATCH_BFF_PUBLIC_URL=https://your-domain
+  WATCH_BFF_COOKIE_SECURE=true
+  ```
+  未配置时 `/auth/wechat/login` 返回 **503 配置错误**,不允许 fallback 到任何共享 token(参考 `web-multiuser-auth.md` 的同款硬约束)
+- [ ] **三个路由**:
+  - `GET  /auth/wechat/login?redirect=<前端回跳路径>` 创建一次性 10 分钟 OAuth state(存 `users.sqlite3` SHA-256 摘要),302 跳微信授权页
+  - `GET  /auth/wechat/callback?code=&state=` 校验 state(code 一次性,用后即删),code 换 openid+unionid(用 `/sns/oauth2/access_token`),建 HttpOnly + SameSite=Lax + Secure 的 `WATCH_SESSION` cookie(value = session_id)
+  - `POST /auth/logout` 撤销 server-side session
+- [ ] **session 存储**:`~/.cache/watch-mcp/users.sqlite3`,schema:
+  ```sql
+  CREATE TABLE users (openid TEXT PRIMARY KEY, unionid TEXT, created_at, last_seen);
+  CREATE TABLE sessions (id TEXT PRIMARY KEY, openid TEXT, expires_at, created_at);
+  CREATE TABLE oauth_states (state_hash TEXT PRIMARY KEY, expires_at);  -- 用后即删
+  ```
+- [ ] **依赖中间件** `require_user(request) -> openid`:读 cookie → 查 sessions 表 → 校验未过期 → 续期;失败抛 401
+- [ ] **`video_id ↔ user_openid` 强校验**:所有 MCP tool(`start_watch` / `get_status` / `get_results` / `recompose` / `delete_session`)接受可选 `user_openid` 参数;`session_store.py` 写记录时持久化 `user_openid`;读取时若 caller 传入 `user_openid`,必须等于记录值,否则拒绝(防止横向越权)。**同 video_id 复用 work_dir 必须同 user**(避免 A 用户的 URL 被 B 用户触发复用)
 
 **Phase 2 完成标志**:
 - web 服务可以在 30 行代码内启动 watch、订阅进度、按 video_id 拉帧
@@ -146,19 +197,23 @@
 |---|---|
 | 后台线程异常导致 session 永远卡在 `running` | `start_watch` 注册 watchdog:90s 无 stage 切换自动写 `error: "watchdog"` 并清理线程 |
 | sessions.json 并发写损坏 | atomic write(temp + os.replace)+ fcntl flock |
-| WebSocket 端口被占 | env var `WATCH_WS_PORT=8765`(默认),启动失败时打印明确错误而非 traceback |
-| stdio + WebSocket 同时跑会双份开销 | Phase 2.3 默认只起 stdio;`--transport http` 时才起 WS |
+| BFF 端口被占 | env var `WATCH_BFF_PORT=8910`(默认),启动失败时打印明确错误而非 traceback |
+| BFF 进程崩溃导致 stdio MCP 子进程成孤儿 | BFF 启动时用 `preexec_fn=os.setsid` 把 MCP 子进程挂到新进程组,BFF exit 时 `os.killpg(SIGTERM)` 清理 |
+| stdio MCP 子进程并发请求冲突(JSON-RPC 必须串行) | BFF 内用 `asyncio.Lock` 串行化所有 tool call,接受 ~50ms 排队延迟 |
 | `watch.run()` 当前会阻塞到结束,后台化需要重构成 yield stage | 不重构 —— 包一层 `threading.Thread(target=watch_mod.run, args=(ns,))` 即可,阶段间通过 polling sessions.json 暴露状态 |
+| 微信服务号 OAuth 未配置时静默放过 | `/auth/wechat/login` 路由在缺 env 时返回 503 明确错误,前端可显示"管理员未配置登录";不 fallback 到任何共享 token |
+| OpenMontage MCP 不可达 | recompose tool 启动时 health-check,失败返回 ToolError 列出 OPENMONTAGE_PATH 和可达性测试命令;BFF 启动时若要 enable recompose 路由,需先连上 OpenMontage |
 
 ---
 
 ## 不做(明确 out-of-scope)
 
-- 多用户隔离 / 权限模型(MVP 单机单用户)
+- 多用户隔离 / 权限模型(MVP 单机单用户,但 Phase 2.8 起为微信用户预留 openid 占位 + session 关联)
 - 跨机器 session 共享(留作 cloud 版)
 - 自动清理过期 session(留给 cron / 外部清理)
 - 把 `download` / `frames` / `transcribe` 各自独立暴露为 MCP tool(粒度过细,Phase 2 的拆分粒度以"stage"为单位)
 - **直接调本地 Remotion / FFmpeg 做最终渲染**(v2+ 一律走 OpenMontage_Voicebox)
+- **GPU-required pipeline**:本机无 GPU,recompose tool 拒绝 `FLUX` / `Kling` / `local_diffusion` / `hunyuan_video` / `wan_video` / `cogvideo_video` 等任何需要 CUDA 的 provider;等 OpenMontage 跑在有 GPU 的机器上时再开放
 
 ---
 
