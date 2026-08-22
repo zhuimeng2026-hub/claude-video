@@ -8,6 +8,8 @@ All notable changes to `/watch` are documented here.
 - **`scripts/watch_to_remotion.py`** — deterministic `/watch` → Remotion converter. Parses the work directory's VTT cues, copies extracted frames (and original video when available), and scaffolds a runnable Remotion 4.x project (`Root.tsx`, `Composition.tsx`, `Subtitles.tsx`) that renders either an `OffthreadVideo` with burned-in subtitles or a frame slideshow. `public/cues.json` is the single source of truth — edit it to retime subtitles or swap modes without touching code. Honors `/watch`'s frame-dedup gaps by exporting actual sorted frame filenames in `framePaths`.
 - **`scripts/watch_to_remotion_smart.py`** — LLM-driven variant. Same input, but an LLM (OpenAI / Groq / LiteLLM, stdlib HTTP, no `pip install` needed) reads the transcript + frame count + duration and produces a structured JSON spec describing scenes, highlights, intro/outro copy, and subtitle styling. The resulting `Composition.tsx` is video-tailored rather than a fixed template. `--dry-run` prints the prompt and scaffolds a project from a `DEFAULT_SPEC` so the pipeline is testable without API credentials.
 
+> **Status (post-0.3.0, 2026-08-23)**: both scripts above are **currently disabled**. The `.py` files have been renamed to `.py_tmp` (i.e. `watch_to_remotion.py_tmp`, `watch_to_remotion_smart.py_tmp`) so Python's import system ignores them. They are kept on disk for re-enable once the adapter refactor in `docs/todo.md` §2.6 is complete. Nothing in `SKILL.md` or `watch.py` invokes them while disabled.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added

@@ -24,7 +24,7 @@ MCP hosts cannot read `SKILL.md` and shell out to its scripts — they speak JSO
 - HTTP / SSE transports (stdio only for v1).
 - Multiple tools (v1 exposes one tool, `watch`).
 - Streaming progress notifications (long tasks block the call; v2 enhancement).
-- A separate Remotion / segmentation tool (these remain CLI-only; users can chain MCP `watch` → manual `segment.py` / `watch_to_remotion.py`).
+- A separate Remotion / segmentation tool (these remain CLI-only). Segmentation runs via `segment.py` (still active). The Remotion converters (`watch_to_remotion.py`, `watch_to_remotion_smart.py`) are **currently disabled** — see `docs/todo.md` §2.6 — and are not available as a follow-up chain step.
 
 ---
 
@@ -319,7 +319,7 @@ Returns JPEG bytes — drop straight into a multimodal context.
 | `mcp` is the first third-party Python dep | Disk + install step on every host. Mitigated by `setup.py` auto-install. |
 | Stdio transport only | v1. SSE/HTTP deferred. Local agents only. |
 | Work dirs not auto-cleaned | User must delete `~/.cache/watch-mcp/` manually. Documented in tool output footer. |
-| One tool | Composition happens client-side. If you want segmented output AND a Remotion scaffold, call `watch` first, then shell out to `segment.py` / `watch_to_remotion.py` directly (these remain CLI scripts). |
+| One tool | Composition happens client-side. If you want segmented output, call `watch` first then shell out to `segment.py` directly (it remains a CLI script). The Remotion converters are disabled — see `docs/todo.md` §2.6 for the re-enable plan. |
 | Session registry is in-process | Server restart loses session IDs. URIs dangling after restart are surfaced as `Unknown resource` errors — clients should re-call `watch` rather than cache URIs across restarts. |
 | Resource reads return raw image bytes | MIME type is `image/jpeg` / `image/png`. Multiplexing or conversion not supported. |
 
