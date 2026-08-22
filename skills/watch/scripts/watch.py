@@ -3,12 +3,18 @@
 
 Prints a markdown report to stdout listing frame paths + transcript. Claude
 then Reads each frame path to see the video.
+
+`main()` is the CLI entry; `run(args)` returns a structured `RunResult` and
+is the function MCP and other programmatic callers should use.
 """
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 import tempfile
+from contextlib import redirect_stdout
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -22,69 +28,33 @@ from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video, has_local_whisper  # noqa: E402
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        prog="watch",
-        description="Download a video, extract auto-scaled frames, and surface the transcript.",
-    )
-    ap.add_argument("source", help="Video URL or local file path")
-    ap.add_argument("--max-frames", type=int, default=None, help="Override frame cap")
-    ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
-    ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
-    ap.add_argument(
-        "--detail",
-        choices=["transcript", "efficient", "balanced", "token-burner"],
-        default=None,
-        help="Fidelity/speed dial: transcript (no frames), efficient (fast keyframes, cap 50), "
-             "balanced (scene, cap 100), token-burner (scene, uncapped).",
-    )
-    ap.add_argument(
-        "--timestamps",
-        type=str,
-        default=None,
-        help="Comma-separated absolute timestamps (SS, MM:SS, HH:MM:SS) to grab a frame at, "
-             "e.g. transcript-flagged 'look here' moments. Added on top of the detail frames "
-             "(reserved against the cap); with --detail transcript these become the only frames.",
-    )
-    ap.add_argument("--start", type=str, default=None, help="Range start (SS, MM:SS, or HH:MM:SS)")
-    ap.add_argument("--end", type=str, default=None, help="Range end (SS, MM:SS, or HH:MM:SS)")
-    ap.add_argument("--out-dir", type=str, default=None, help="Working directory (default: tmp)")
-    ap.add_argument(
-        "--no-whisper",
-        action="store_true",
-        help="Disable Whisper fallback. Report frames-only if no captions available.",
-    )
-    ap.add_argument(
-        "--whisper",
-        choices=["groq", "openai", "local"],
-        default=None,
-        help="Force a specific Whisper backend. local=faster-whisper (no API key needed).",
-    )
-    ap.add_argument(
-        "--no-dedup",
-        action="store_true",
-        help="Disable near-duplicate frame removal. Keeps visually identical "
-             "frames (static screen recordings, held slides) instead of collapsing them.",
-    )
-    ap.add_argument(
-        "--segment",
-        action="store_true",
-        help="Run SAM 2 video segmentation via Replicate (requires REPLICATE_API_TOKEN).",
-    )
-    ap.add_argument(
-        "--segment-points",
-        type=str,
-        default=None,
-        help='SAM 2 prompt points as "x,y x,y ..." (default: center of first frame).',
-    )
-    ap.add_argument(
-        "--segment-labels",
-        type=str,
-        default=None,
-        help="Point labels: 1=foreground 0=background (default: all foreground).",
-    )
-    args = ap.parse_args()
+@dataclass
+class RunResult:
+    """Structured return value of `watch.run()`.
 
+    `report` is the byte-identical markdown that the CLI prints to stdout —
+    callers that want a human-readable summary read `report`. `frames`,
+    `masks`, `transcript_segments`, etc. expose the same data structurally
+    so programmatic callers (the MCP server) don't have to parse markdown.
+    """
+    report: str
+    frames: list[dict] = field(default_factory=list)
+    masks: list[dict] = field(default_factory=list)
+    transcript_segments: list[dict] = field(default_factory=list)
+    transcript_text: str | None = None
+    transcript_source: str | None = None
+    work_dir: Path | None = None
+    meta: dict = field(default_factory=dict)
+    returncode: int = 0
+
+
+def run(args: argparse.Namespace) -> RunResult:
+    """Run the watch pipeline end-to-end and return a structured RunResult.
+
+    Status messages go to stderr; the markdown report is captured into
+    RunResult.report (no stdout writes happen here). The CLI `main()`
+    writes `report` to stdout after this returns.
+    """
     config = get_config()
     detail = args.detail or str(config["detail"])
     configured_cap = frame_cap(detail)
@@ -345,135 +315,228 @@ def main() -> int:
 
     info = dl.get("info") or {}
 
-    print()
-    print("# watch: video report")
-    print()
-    print(f"- **Source:** {args.source}")
-    if info.get("title"):
-        print(f"- **Title:** {info['title']}")
-    if info.get("uploader"):
-        print(f"- **Uploader:** {info['uploader']}")
-    print(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
-    if focused:
-        print(
-            f"- **Focus range:** {format_time(effective_start)} → {format_time(effective_end)} "
-            f"({effective_duration:.1f}s)"
-        )
-    if meta.get("width") and meta.get("height"):
-        print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
-    range_mode = "focused" if focused else "full"
-    print(f"- **Detail:** {detail}")
-    detail_count = frame_meta.get("selected_count", 0)
-    if detail != "transcript":
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
-        engine = frame_meta.get("engine", "scene")
-        fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
-        deduped = frame_meta.get("deduped_count", 0)
-        dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
-        print(
-            f"- **Frames:** {detail_count} selected from {frame_meta.get('candidate_count', detail_count)} "
-            f"candidates ({engine}{fallback}{dedup_note}, {range_mode} range, budget {target}, cap {cap_label})"
-        )
-    elif not cue_frames:
-        print("- **Frames:** skipped (transcript detail)")
-    if cue_frames:
-        dropped = cue_meta.get("dropped_out_of_window", 0)
-        drop_note = f", {dropped} dropped outside range" if dropped else ""
-        print(
-            f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
-            f"(transcript-cue{drop_note})"
-        )
-    if frames:
-        print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
-    if transcript_segments:
-        in_range = " in range" if focused else ""
-        print(
-            f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
-            f"(via {transcript_source or 'captions'})"
-        )
-    else:
-        print("- **Transcript:** none available")
-
-    if detail == "token-burner" and len(frames) > 250:
+    # The markdown report is captured into RunResult.report — stdout is
+    # redirected here so the CLI's stdout bytes are identical to what main()
+    # writes from RunResult.report. Status messages above (file=sys.stderr)
+    # are unaffected by the redirect.
+    report_buf = io.StringIO()
+    with redirect_stdout(report_buf):
         print()
-        print(
-            f"> **Warning:** token-burner detail selected {len(frames)} frames. "
-            "This may use a large number of image tokens."
-        )
-
-    if not focused and full_duration > 600 and detail not in ("transcript", "token-burner"):
-        mins = int(full_duration // 60)
+        print("# watch: video report")
         print()
-        print(
-            f"> **Warning:** This is a {mins}-minute video. Frame coverage is sparse at this length "
-            f"under `{detail}` detail — its cap spreads thin across the full clip. For better results, "
-            "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a section, or use "
-            "`--detail token-burner` to keep every scene-change frame across the whole video."
-        )
-
-    print()
-    print("## Frames")
-    print()
-    if frames:
-        print(f"Frames live at: `{work / 'frames'}`")
-        print()
-        print(
-            "**Read each frame path below with the Read tool to view the image.** "
-            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
-        )
-        print()
-        for frame in frames:
-            print(
-                f"- `{frame['path']}` "
-                f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
-            )
-    else:
-        print("_No frames extracted._")
-
-    if segment_result and segment_result.get("masks"):
-        print()
-        print("## Segmentation Masks")
-        print()
-        print(f"Masks live at: `{work / 'masks'}`")
-        print()
-        for m in segment_result["masks"]:
-            print(f"- `{m['path']}` (frame {m['index']})")
-
-    print()
-    print("## Transcript")
-    print()
-    if transcript_text:
-        label = transcript_source or "captions"
+        print(f"- **Source:** {args.source}")
+        if info.get("title"):
+            print(f"- **Title:** {info['title']}")
+        if info.get("uploader"):
+            print(f"- **Uploader:** {info['uploader']}")
+        print(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
         if focused:
-            print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
+            print(
+                f"- **Focus range:** {format_time(effective_start)} → {format_time(effective_end)} "
+                f"({effective_duration:.1f}s)"
+            )
+        if meta.get("width") and meta.get("height"):
+            print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
+        range_mode = "focused" if focused else "full"
+        print(f"- **Detail:** {detail}")
+        detail_count = frame_meta.get("selected_count", 0)
+        if detail != "transcript":
+            cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+            engine = frame_meta.get("engine", "scene")
+            fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
+            deduped = frame_meta.get("deduped_count", 0)
+            dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
+            print(
+                f"- **Frames:** {detail_count} selected from {frame_meta.get('candidate_count', detail_count)} "
+                f"candidates ({engine}{fallback}{dedup_note}, {range_mode} range, budget {target}, cap {cap_label})"
+            )
+        elif not cue_frames:
+            print("- **Frames:** skipped (transcript detail)")
+        if cue_frames:
+            dropped = cue_meta.get("dropped_out_of_window", 0)
+            drop_note = f", {dropped} dropped outside range" if dropped else ""
+            print(
+                f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
+                f"(transcript-cue{drop_note})"
+            )
+        if frames:
+            print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
+        if transcript_segments:
+            in_range = " in range" if focused else ""
+            print(
+                f"- **Transcript:** {len(transcript_segments)} segments{in_range} "
+                f"(via {transcript_source or 'captions'})"
+            )
         else:
-            print(f"_Source: {label}._")
+            print("- **Transcript:** none available")
+
+        if detail == "token-burner" and len(frames) > 250:
+            print()
+            print(
+                f"> **Warning:** token-burner detail selected {len(frames)} frames. "
+                "This may use a large number of image tokens."
+            )
+
+        if not focused and full_duration > 600 and detail not in ("transcript", "token-burner"):
+            mins = int(full_duration // 60)
+            print()
+            print(
+                f"> **Warning:** This is a {mins}-minute video. Frame coverage is sparse at this length "
+                f"under `{detail}` detail — its cap spreads thin across the full clip. For better results, "
+                "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a section, or use "
+                "`--detail token-burner` to keep every scene-change frame across the whole video."
+            )
+
         print()
-        print("```")
-        print(transcript_text)
-        print("```")
-    elif detail == "transcript":
-        print(
-            "_No transcript available at transcript detail. Captions were missing and Whisper was "
-            "unavailable or failed, so there is no visual fallback here. Re-run with "
-            "`--detail balanced` for frames._"
-        )
-    elif focused and dl.get("subtitle_path"):
-        print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
-    else:
-        setup_py = SCRIPT_DIR / "setup.py"
-        print(
-            "_No transcript available — proceed with frames only. "
-            "Captions were missing and the Whisper fallback was unavailable "
-            "(no API key set, or `--no-whisper` was used). "
-            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
-        )
+        print("## Frames")
+        print()
+        if frames:
+            print(f"Frames live at: `{work / 'frames'}`")
+            print()
+            print(
+                "**Read each frame path below with the Read tool to view the image.** "
+                "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
+            )
+            print()
+            for frame in frames:
+                print(
+                    f"- `{frame['path']}` "
+                    f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
+                )
+        else:
+            print("_No frames extracted._")
 
-    print()
-    print("---")
-    print(f"_Work dir: `{work}` — delete when done._")
+        if segment_result and segment_result.get("masks"):
+            print()
+            print("## Segmentation Masks")
+            print()
+            print(f"Masks live at: `{work / 'masks'}`")
+            print()
+            for m in segment_result["masks"]:
+                print(f"- `{m['path']}` (frame {m['index']})")
 
-    return 0
+        print()
+        print("## Transcript")
+        print()
+        if transcript_text:
+            label = transcript_source or "captions"
+            if focused:
+                print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
+            else:
+                print(f"_Source: {label}._")
+            print()
+            print("```")
+            print(transcript_text)
+            print("```")
+        elif detail == "transcript":
+            print(
+                "_No transcript available at transcript detail. Captions were missing and Whisper was "
+                "unavailable or failed, so there is no visual fallback here. Re-run with "
+                "`--detail balanced` for frames._"
+            )
+        elif focused and dl.get("subtitle_path"):
+            print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
+        else:
+            setup_py = SCRIPT_DIR / "setup.py"
+            print(
+                "_No transcript available — proceed with frames only. "
+                "Captions were missing and the Whisper fallback was unavailable "
+                "(no API key set, or `--no-whisper` was used). "
+                f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+            )
+
+        print()
+        print("---")
+        print(f"_Work dir: `{work}` — delete when done._")
+
+    return RunResult(
+        report=report_buf.getvalue(),
+        frames=list(frames),
+        masks=list(segment_result.get("masks", [])) if segment_result else [],
+        transcript_segments=list(transcript_segments),
+        transcript_text=transcript_text,
+        transcript_source=transcript_source,
+        work_dir=work,
+        meta={
+            "duration_seconds": full_duration,
+            "width": meta.get("width"),
+            "height": meta.get("height"),
+            "codec": meta.get("codec"),
+            "has_audio": meta.get("has_audio", False),
+            "focused": focused,
+            "detail": detail,
+            "info": dict(info),
+        },
+        returncode=0,
+    )
+
+
+def main() -> int:
+    """CLI entry point. Parses args, calls run(), writes the markdown report."""
+    ap = argparse.ArgumentParser(
+        prog="watch",
+        description="Download a video, extract auto-scaled frames, and surface the transcript.",
+    )
+    ap.add_argument("source", help="Video URL or local file path")
+    ap.add_argument("--max-frames", type=int, default=None, help="Override frame cap")
+    ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
+    ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
+    ap.add_argument(
+        "--detail",
+        choices=["transcript", "efficient", "balanced", "token-burner"],
+        default=None,
+        help="Fidelity/speed dial: transcript (no frames), efficient (fast keyframes, cap 50), "
+             "balanced (scene, cap 100), token-burner (scene, uncapped).",
+    )
+    ap.add_argument(
+        "--timestamps",
+        type=str,
+        default=None,
+        help="Comma-separated absolute timestamps (SS, MM:SS, HH:MM:SS) to grab a frame at, "
+             "e.g. transcript-flagged 'look here' moments. Added on top of the detail frames "
+             "(reserved against the cap); with --detail transcript these become the only frames.",
+    )
+    ap.add_argument("--start", type=str, default=None, help="Range start (SS, MM:SS, or HH:MM:SS)")
+    ap.add_argument("--end", type=str, default=None, help="Range end (SS, MM:SS, or HH:MM:SS)")
+    ap.add_argument("--out-dir", type=str, default=None, help="Working directory (default: tmp)")
+    ap.add_argument(
+        "--no-whisper",
+        action="store_true",
+        help="Disable Whisper fallback. Report frames-only if no captions available.",
+    )
+    ap.add_argument(
+        "--whisper",
+        choices=["groq", "openai", "local"],
+        default=None,
+        help="Force a specific Whisper backend. local=faster-whisper (no API key needed).",
+    )
+    ap.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Disable near-duplicate frame removal. Keeps visually identical "
+             "frames (static screen recordings, held slides) instead of collapsing them.",
+    )
+    ap.add_argument(
+        "--segment",
+        action="store_true",
+        help="Run SAM 2 video segmentation via Replicate (requires REPLICATE_API_TOKEN).",
+    )
+    ap.add_argument(
+        "--segment-points",
+        type=str,
+        default=None,
+        help='SAM 2 prompt points as "x,y x,y ..." (default: center of first frame).',
+    )
+    ap.add_argument(
+        "--segment-labels",
+        type=str,
+        default=None,
+        help="Point labels: 1=foreground 0=background (default: all foreground).",
+    )
+    args = ap.parse_args()
+    result = run(args)
+    sys.stdout.write(result.report)
+    return result.returncode
 
 
 if __name__ == "__main__":
