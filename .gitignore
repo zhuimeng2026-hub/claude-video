@@ -64,6 +64,16 @@ web-platform/work/
 web-platform/backend/video-workflow
 web-platform/backend/*.db
 
+# Local research / planning notes (not part of the repo's tracked surface)
+CHINA_PLATFORM_VIDEO_SEGMENTATION_COMPARISON.md
+REPLICATE_SAM2_VIDEO_PRICING.md
+UNIAPP_BUILD_BUG_REPORT.md
+VIDEO_STUDIO_PLAN.md
+
+# Local workflow / /watch run artifacts
+byd-workflow-demo/
+watch-dQw4w9WgXcQ/
+
 # Go build output
 *.exe
 *.dll
