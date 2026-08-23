@@ -446,6 +446,31 @@ Returns JPEG bytes — drop straight into a multimodal context.
 | Session registry is in-process | Server restart loses session IDs. URIs dangling after restart are surfaced as `Unknown resource` errors — clients should re-call `watch` rather than cache URIs across restarts. |
 | Resource reads return raw image bytes | MIME type is `image/jpeg` / `image/png`. Multiplexing or conversion not supported. |
 
+### 6.1 Known SDK pitfalls (read this before debugging session crashes)
+
+Three independent SDK gotchas caught by `tests/test_mcp_stdio_smoke.py`. Each has a one-line cause and a one-line fix. If you see `PydanticUserError`, an `AttributeError` on a resource block, or a smoke test fail at collection time, this section tells you which pitfall you hit.
+
+**Pitfall A — bare `bytes` return type crashes `@mcp.resource`** (Phase 1.5)
+
+- **Symptom**: server fails to import. `pydantic.errors.PydanticUserError: A non-annotated attribute was detected: result = <class 'bytes'>`.
+- **Cause**: FastMCP wraps the resource function's return type via `pydantic.create_model(model_name, result=annotation)`. Under pydantic 2.10+, bare `bytes` cannot be modeled as a field — it requires explicit `FieldInfo`. Hit with `mcp>=1.20` + `pydantic>=2.10`.
+- **Fix**: wrap the return type as `Annotated[bytes, Field(description="...")]`. Forward-compatible with newer mcp versions because `Annotated[..., Field(...)]` is the supported pattern.
+- **Files**: `skills/watch/scripts/mcp_server.py:170, 202` (`read_frame`, `read_mask`).
+
+**Pitfall B — `importlib.util.spec_from_file_location` synthesizes a module name not in `sys.modules`**
+
+- **Symptom**: a test or script that loads `mcp_server.py` via `spec_from_file_location("mcp_server_probe", path)` reports `NameError: name 'Annotated' is not defined` even though `mcp_server.py` imports cleanly under normal `import mcp_server`.
+- **Cause**: FastMCP wraps functions with `pydantic.validate_call`. When pydantic evaluates string annotations (PEP 563 / `from __future__ import annotations`), it uses `get_module_ns_of(obj)` which does `sys.modules[obj.__module__].__dict__`. Synthetic module names never get registered in `sys.modules`, so `Annotated` / `Field` aren't found.
+- **Fix**: load the module via `import mcp_server` after `sys.path.insert(0, SCRIPT_DIR)`. Never use `spec_from_file_location` for modules that import from pydantic / typing.
+- **Files**: `tests/test_mcp_stdio_smoke.py::_check_server_imports`.
+
+**Pitfall C — `BlobResourceContents` payload is base64, not raw bytes**
+
+- **Symptom**: `AttributeError: 'BlobResourceContents' object has no attribute 'content'` when reading a frame/mask resource.
+- **Cause**: MCP 2024-11-05 resource blocks carry content as either `BlobResourceContents.blob` (base64-encoded string, used for binary) or `TextResourceContents.text` (UTF-8 string, used for text). Newer `mcp` SDK versions do not expose a `.content` shortcut — clients must branch on the type and decode.
+- **Fix**: `block = res.contents[0]; if hasattr(block, "blob"): raw = base64.b64decode(block.blob); elif hasattr(block, "text"): raw = block.text.encode()`.
+- **Files**: `tests/test_mcp_stdio_smoke.py::_worker_entry`.
+
 ---
 
 ## 7. Reference

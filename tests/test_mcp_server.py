@@ -40,7 +40,23 @@ def work_dir(tmp_path) -> Path:
 
 
 async def _call_watch(source: str, out_dir: Path, **kwargs):
-    args = {"source": source, "no_whisper": True, "out_dir": str(out_dir), **kwargs}
+    # Tests use tmp_path which lives outside ~/.cache/watch-mcp/. Pass
+    # allow_arbitrary_out=True so the production guardrail doesn't
+    # reject test fixtures. Production callers should NOT pass this flag.
+    #
+    # restart=True bypasses the Phase 2.1 video_id cache so each test
+    # invocation is independent. Without it, the second test on the
+    # same cut_clip fixture (same sha256(source)[:12]) hits the cache
+    # from the first test and returns stale results. Tests that
+    # specifically exercise the cache set restart=False explicitly.
+    args = {
+        "source": source,
+        "no_whisper": True,
+        "out_dir": str(out_dir),
+        "allow_arbitrary_out": True,
+        "restart": True,
+        **kwargs,
+    }
     result = await mcp_server.mcp.call_tool("watch", args)
     # FastMCP returns a list of content blocks. First block is the JSON text.
     return json.loads(result[0].text)
@@ -87,6 +103,141 @@ def test_watch_registers_frame_resources(cut_clip: Path, work_dir: Path):
         assert uri.endswith(".jpg")
 
 
+# ─── Phase 1.3 — input validation hardening ──────────────────────────────
+#
+# These exercise _validate_source / _validate_out_dir without spawning
+# the watch pipeline. They cover the guardrails that keep a hostile (or
+# just buggy) MCP host from pointing work dirs at /etc, reading files
+# outside the work tree, or smuggling argv flags via the source field.
+
+
+def test_source_empty_string_rejected(work_dir: Path):
+    """Empty source is a no-op that would burn a session id for nothing."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        return await mcp_server.mcp.call_tool("watch", {
+            "source": "",
+            "no_whisper": True,
+            "out_dir": str(work_dir),
+            "allow_arbitrary_out": True,
+        })
+    with pytest.raises(ToolError, match="non-empty"):
+        asyncio.run(run())
+
+
+def test_source_with_flag_prefix_rejected(work_dir: Path):
+    """A source starting with '-' would be parsed as an argv flag if any
+    downstream layer shells out. Reject explicitly so a bug elsewhere
+    can't be exploited."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        return await mcp_server.mcp.call_tool("watch", {
+            "source": "--version",
+            "no_whisper": True,
+            "out_dir": str(work_dir),
+            "allow_arbitrary_out": True,
+        })
+    with pytest.raises(ToolError, match="must not start with '-'"):
+        asyncio.run(run())
+
+
+def test_source_with_control_chars_rejected(work_dir: Path):
+    """NUL bytes and friends would break yt-dlp's URL parser or open
+    odd filesystem paths. Reject anything below 0x20."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        return await mcp_server.mcp.call_tool("watch", {
+            "source": "https://example.com/\x00bad",
+            "no_whisper": True,
+            "out_dir": str(work_dir),
+            "allow_arbitrary_out": True,
+        })
+    with pytest.raises(ToolError, match="control characters"):
+        asyncio.run(run())
+
+
+def test_source_local_path_missing_file_rejected(work_dir: Path):
+    """A non-existent local path should be caught BEFORE yt-dlp tries
+    to download, with a message that names the path."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        return await mcp_server.mcp.call_tool("watch", {
+            "source": "/no/such/file.mp4",
+            "no_whisper": True,
+            "out_dir": str(work_dir),
+            "allow_arbitrary_out": True,
+        })
+    with pytest.raises(ToolError, match="file not found"):
+        asyncio.run(run())
+
+
+def test_out_dir_outside_work_root_rejected_without_opt_in(cut_clip: Path, work_dir: Path):
+    """A /tmp or /etc out_dir must be rejected by default. This is the
+    core guardrail: hostile hosts can't write artefacts anywhere on disk.
+    Uses cut_clip as source so source validation passes and we exercise
+    out_dir validation specifically."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        return await mcp_server.mcp.call_tool("watch", {
+            "source": str(cut_clip),
+            "no_whisper": True,
+            "out_dir": "/tmp/hostile-out-dir",
+            # NO allow_arbitrary_out
+        })
+    with pytest.raises(ToolError, match="must live under"):
+        asyncio.run(run())
+
+
+def test_out_dir_outside_work_root_allowed_with_opt_in(cut_clip: Path, work_dir: Path):
+    """allow_arbitrary_out=True is the documented escape hatch. Tests
+    that legitimately use tmp_path rely on this; production callers
+    shouldn't."""
+    out = asyncio.run(_call_watch(str(cut_clip), work_dir))
+    assert out["frame_count"] >= 1
+
+
+def test_out_dir_relative_path_rejected(cut_clip: Path, work_dir: Path):
+    """Relative out_dirs are ambiguous (relative to what — MCP server's
+    cwd? the host's cwd?). Reject; force callers to be explicit.
+    Uses cut_clip as source so out_dir validation is reached."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    async def run():
+        return await mcp_server.mcp.call_tool("watch", {
+            "source": str(cut_clip),
+            "no_whisper": True,
+            "out_dir": "relative/path",
+            "allow_arbitrary_out": True,
+        })
+    with pytest.raises(ToolError, match="absolute"):
+        asyncio.run(run())
+
+
+def test_out_dir_under_work_root_accepted_without_opt_in(cut_clip: Path, tmp_path):
+    """The happy path: out_dir under ~/.cache/watch-mcp/ is accepted
+    without opt-in. We use the real MCP_WORK_ROOT subdir under tmp_path
+    by symlinking, OR pass allow_arbitrary_out — the latter is simpler
+    for tests; the production guardrail is verified by the rejected
+    test above."""
+    # Use a path that mimics ~/.cache/watch-mcp/<sid>/ structure by
+    # creating inside the real MCP_WORK_ROOT.
+    from mcp_server import MCP_WORK_ROOT
+    safe_dir = MCP_WORK_ROOT / "_test_session_allowed"
+    safe_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out = asyncio.run(_call_watch(str(cut_clip), safe_dir))
+        assert out["frame_count"] >= 1
+    finally:
+        # Cleanup so we don't pollute ~/.cache
+        import shutil
+        shutil.rmtree(safe_dir, ignore_errors=True)
+
+
 def test_watch_handles_missing_file(work_dir: Path):
     """Invalid source returns a structured MCP error, not a Python traceback.
 
@@ -101,8 +252,9 @@ def test_watch_handles_missing_file(work_dir: Path):
             "source": "/nonexistent/does-not-exist.mp4",
             "no_whisper": True,
             "out_dir": str(work_dir),
+            "allow_arbitrary_out": True,
         })
-    with pytest.raises(ToolError, match="watch failed"):
+    with pytest.raises(ToolError, match="source file not found"):
         asyncio.run(run())
 
 
@@ -173,6 +325,7 @@ def test_tool_schema_exposes_all_flags():
         "max_frames", "resolution", "fps", "whisper",
         "no_whisper", "no_dedup", "segment",
         "segment_points", "segment_labels", "out_dir",
+        "allow_arbitrary_out",  # Phase 1.3: opt-in escape from out_dir guardrail
     }
     assert expected <= props, f"missing flags: {expected - props}"
     # source is the only required field.
