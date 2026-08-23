@@ -24,7 +24,7 @@ MCP hosts cannot read `SKILL.md` and shell out to its scripts — they speak JSO
 - HTTP / SSE transports (stdio only for v1).
 - Multiple tools (v1 exposes one tool, `watch`).
 - Streaming progress notifications (long tasks block the call; v2 enhancement).
-- A separate Remotion / segmentation tool (these remain CLI-only). Segmentation runs via `segment.py` (still active). The Remotion converters (`watch_to_remotion.py`, `watch_to_remotion_smart.py`) are **re-enabled as of 2026-08-23** (were temporarily parked as `.py_tmp` in `1cac74b`, accidentally deleted in `0538676`, restored in the same update). The §2.6 "v2+ must route through OpenMontage" hard constraint still applies — these converters are usable but should not be invoked from the `/watch` MCP server's main flow. See `docs/todo.md` §2.6.1 for the four pending items (adapter refactor / env guard / guard test / etc.).
+- A separate Remotion / segmentation tool (these remain CLI-only). Segmentation runs via `segment.py` (still active). The Remotion converters (`watch_to_remotion.py`, `watch_to_remotion_smart.py`) are **currently disabled** (kept on disk as `.py_tmp` files since commit `1cac74b`; briefly re-enabled in `73c92da` then reverted on 2026-08-23) and are not available as a follow-up chain step. See `docs/todo.md` §2.6 for the §2.6.1 re-enable gates.
 
 ---
 

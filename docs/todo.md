@@ -109,7 +109,9 @@
 
 #### 2.6.1 旧脚本退役 + 守卫
 
-> **Status (2026-08-23, updated)**: **Re-enabled by user override.** The `.py_tmp` files were accidentally deleted in commit `0538676` (Phase 2.x commit, side-effect of the broader Phase 2 work), which closed the documented re-enable path. On 2026-08-23 the user restored the files and renamed them back to `.py` so the canonical filenames work. **The 4 conditions below remain open** — adapter refactor not done, env guard not added, `test_remotion_guard.py` not added. They are now **regression-prevention work** rather than re-enable gates: the scripts are importable again, but anyone working on them must respect the §2.6 "v2+ must route through OpenMontage" hard constraint (don't invoke from the `/watch` MCP server's main flow). The original "现状" block (`.py_tmp` park) is preserved as historical record below for completeness.
+> **Status (2026-08-23, final)**: **Disabled again, restoring original Phase A park state.** Briefly re-enabled in commit `73c92da` (mv *.py_tmp → *.py) by user override, then reverted on the same day. The four §2.6.1 conditions remain open — they are regression-prevention work, not re-enable gates. To re-enable in the future: complete the four items below, then `mv *.py_tmp *.py`.
+
+> **Status (2026-08-23, superseded)** ~~Re-enabled by user override.~~ Briefly re-enabled in `73c92da` then reverted. The `.py_tmp` files were accidentally deleted in commit `0538676` (Phase 2.x side-effect), which closed the documented re-enable path. On 2026-08-23 the user first restored the files and renamed them back to `.py` so the canonical filenames work, then later the same day reversed course and renamed back to `.py_tmp`. The 4 conditions below remain open — they are now **regression-prevention work** rather than re-enable gates.
 
 
 - [ ] `skills/watch/scripts/watch_to_remotion.py`:删除 `subprocess.run(["npx", "remotion", ...])` 路径(`watch_to_remotion.py:101` 附近的 `ffprobe` 调用可以保留——它只是探测时长,不渲染);脚本改为 **adapter**:把 watch 产物(VTT + frames + video)打包成 OpenMontage 可消费的输入清单,调用 OpenMontage 的 MCP tool `execute_tool(tool_name="video_compose", inputs={...})` 提交
