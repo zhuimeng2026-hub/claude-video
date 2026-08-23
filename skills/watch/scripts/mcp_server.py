@@ -739,6 +739,114 @@ def cancel_watch(video_id: str) -> dict[str, Any]:
     return {"cancelled": True, "video_id": video_id}
 
 
+# ─── Phase 2.6 — recompose via OpenMontage_Voicebox ──────────────────────
+#
+# v2+ hard constraint: NO local Remotion / local final-render ffmpeg.
+# recompose forwards the watch session record to OpenMontage's MCP
+# server, which has 12 production pipelines + stage orchestration +
+# Backlot storyboard. See OpenMontage_Voicebox/docs/claude-video-integration.md
+# for the cross-repo contract.
+
+
+@mcp.tool(
+    name="recompose",
+    description=(
+        "Submit a completed /watch session to OpenMontage_Voicebox for "
+        "recomposition (montage, captions, highlight reel, etc.).\n\n"
+        "**GPU-free constraint**: this box has no GPU. `recompose` "
+        "accepts only OpenMontage pipelines that don't touch GPU "
+        "providers (FLUX / Kling / local_diffusion / video diffusion "
+        "models are rejected). Default whitelisted pipelines: "
+        "`clip-factory`, `documentary-montage`, `podcast-repurpose`, "
+        "`localization-dub`, `hybrid`, `screen-demo`.\n\n"
+        "Requires the OpenMontage MCP binary at OPENMONTAGE_BIN "
+        "(default `/opt/OpenMontage_Voicebox/mcp_server.py`). The "
+        "OpenMontage side stores outputs under "
+        "`projects/users/<user_openid>/<video_id>/renders/final.mp4`.\n\n"
+        "Returns: {project_id, status: 'submitted', pipeline, "
+        "render_url?, work_dir}. Raises ToolError on pipeline rejection "
+        "or OpenMontage unavailability."
+    ),
+    structured_output=False,
+)
+async def recompose(
+    video_id: str,
+    pipeline: Literal[
+        "clip-factory",
+        "documentary-montage",
+        "podcast-repurpose",
+        "localization-dub",
+        "hybrid",
+        "screen-demo",
+    ] = "clip-factory",
+    style: str = "clean-professional",
+    user_openid: str | None = None,
+    user_unionid: str | None = None,
+) -> dict[str, Any]:
+    record = ss_get(video_id)
+    if record is None:
+        raise ToolError(
+            f"no session record for video_id={video_id!r}. "
+            f"Run /watch (or start_watch) first, then recompose."
+        )
+    if record.status != "done":
+        raise ToolError(
+            f"video_id={video_id!r} status is {record.status!r}, not 'done'. "
+            f"Wait for the pipeline to finish, or call cancel_watch + restart."
+        )
+
+    work = Path(record.work_dir)
+    frames_dir = work / "frames"
+    masks_dir = work / "masks"
+    # Find VTT under download/
+    vtt_candidates = sorted((work / "download").glob("video*.vtt")) if (work / "download").is_dir() else []
+    vtt_path = str(vtt_candidates[0]) if vtt_candidates else None
+    # Find source video
+    video_candidates = sorted((work / "download").glob("video.*")) if (work / "download").is_dir() else []
+    video_path = str(video_candidates[0]) if video_candidates else None
+
+    # Resolve effective user_openid: prefer caller-provided, fall back
+    # to the record's stored openid (covers the case where the same
+    # operator who created the session now wants to recompose it).
+    effective_openid = user_openid or record.user_openid
+
+    # Lazy import to avoid loading mcp SDK on every server start.
+    import openmontage_client
+
+    try:
+        result = await openmontage_client.submit_compose(
+            video_id=video_id,
+            user_openid=effective_openid,
+            work_dir=record.work_dir,
+            frames_dir=str(frames_dir) if frames_dir.is_dir() else "",
+            masks_dir=str(masks_dir) if masks_dir.is_dir() else None,
+            vtt_path=vtt_path,
+            video_path=video_path,
+            pipeline=pipeline,
+            style=style,
+            extra={
+                "user_unionid": effective_openid and user_unionid,
+                "claude_video_source": "watch_mcp",
+            },
+        )
+    except openmontage_client.PipelineNotAllowedError as exc:
+        raise ToolError(str(exc)) from None
+    except openmontage_client.OpenMontageUnavailableError as exc:
+        raise ToolError(str(exc)) from None
+    except openmontage_client.OpenMontageError as exc:
+        raise ToolError(f"recompose failed: {exc}") from None
+
+    return {
+        "project_id": result.get("project_id", video_id),
+        "status": result.get("status", "submitted"),
+        "pipeline": pipeline,
+        "style": style,
+        "video_id": video_id,
+        "render_url": result.get("render_url"),
+        "work_dir": record.work_dir,
+    }
+
+
 @mcp.resource(
     "watch-frame://{session_id}/frames/{filename}",
     name="read_frame",
