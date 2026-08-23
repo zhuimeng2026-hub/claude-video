@@ -210,39 +210,28 @@ async def submit_compose(
         env=None,
     )
 
-    try:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                init_result = await asyncio.wait_for(
-                    session.initialize(),
-                    timeout=startup_timeout,
-                )
-                # Hand-rolled dispatch: we call `claude_video.compose` tool
-                # directly. The Phase 2.6 cross-repo doc lists this as
-                # the canonical tool name.
-                result = await asyncio.wait_for(
-                    session.call_tool("claude_video.compose", inputs),
-                    timeout=300.0,  # 5 min max for submit; actual render is async
-                )
-                # Unwrap FastMCP content blocks
-                content = result.content
-                if not content:
-                    raise OpenMontageError("OpenMontage returned empty content")
-                first = content[0]
-                text = getattr(first, "text", None) or json.dumps(inputs)  # fallback
-                try:
-                    parsed = json.loads(text)
-                except json.JSONDecodeError:
-                    parsed = {"raw_text": text}
-                return parsed
-    except asyncio.TimeoutError as exc:
-        raise OpenMontageUnavailableError(
-            f"OpenMontage MCP handshake timed out after {startup_timeout}s"
-        ) from exc
-    except FileNotFoundError as exc:
-        raise OpenMontageUnavailableError(
-            f"OpenMontage MCP binary {openmontage_bin()} not found or not executable"
-        ) from exc
-    except Exception as exc:
-        # Many MCP errors are tool errors — surface the message
-        raise OpenMontageError(f"OpenMontage call failed: {exc}") from exc
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await asyncio.wait_for(
+                session.initialize(),
+                timeout=startup_timeout,
+            )
+            # Hand-rolled dispatch: we call `claude_video.compose` tool
+            # directly. The Phase 2.6 cross-repo doc lists this as
+            # the canonical tool name. The tool signature is
+            # `compose(inputs: dict)` — FastMCP wraps the call so
+            # we must pass `{"inputs": ...}` not the raw dict.
+            result = await asyncio.wait_for(
+                session.call_tool("claude_video.compose", {"inputs": inputs}),
+                timeout=300.0,  # 5 min max for submit; actual render is async
+            )
+            # Unwrap FastMCP content blocks
+            content = result.content
+            if not content:
+                raise OpenMontageError("OpenMontage returned empty content")
+            first = content[0]
+            text = getattr(first, "text", None) or json.dumps(inputs)  # fallback
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"raw_text": text}

@@ -93,6 +93,7 @@ from pydantic import BaseModel
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import bff_metrics  # noqa: E402
 import users_store  # noqa: E402
 import wechat_oauth  # noqa: E402
 
@@ -106,76 +107,108 @@ def _sse_format(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _path_to_tool_label(path: str) -> str:
+    """Map BFF URL path -> Prometheus label value. Used by the
+    metrics middleware to bucket request counts by tool."""
+    # /api/watch/{video_id}/status, /events, /cancel, /results, etc.
+    if path.startswith("/api/watch/"):
+        parts = path.split("/")
+        # parts = ['', 'api', 'watch', '{video_id}', '<sub>']
+        if len(parts) >= 5:
+            sub = parts[4]
+            return {
+                "start": "watch_start",
+                "status": "get_status",
+                "results": "get_results",
+                "events": "get_events",
+                "cancel": "cancel_watch",
+                "frame": "read_frame",
+                "mask": "read_mask",
+            }.get(sub, "watch_other")
+    if path.startswith("/api/sessions/"):
+        return "delete_session"
+    if path.startswith("/api/sessions"):
+        return "list_sessions"
+    if path.startswith("/api/recompose"):
+        return "recompose"
+    if path.startswith("/auth/"):
+        return "oauth"
+    if path.startswith("/healthz"):
+        return "healthz"
+    if path.startswith("/readyz"):
+        return "readyz"
+    if path.startswith("/metrics"):
+        return "metrics"
+    return "other"
+
+
 # ─── BFFState — the persistent stdio MCP connection ───────────────────────
 
 
-class BFFState:
-    """One process holds one stdio MCP subprocess + ClientSession.
+class _Slot:
+    """One MCP subprocess + ClientSession + asyncio.Lock.
 
-    Lifetimes match the FastAPI app via the lifespan context manager.
-    Tests use ASGITransport with lifespan="on" so the state is started
-    before requests and torn down after.
+    Phase 3.3 — pool of these lets the BFF serve N watches in
+    parallel. Each slot is independent: subprocess crash in slot A
+    doesn't affect slots B/C/D.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, index: int, mcp_server_path: Path) -> None:
+        self.index = index
+        self.mcp_server_path = mcp_server_path
         self._stdio_ctx = None
         self._session = None
-        self._subprocess = None
         self.lock = asyncio.Lock()
 
-    async def start(self, mcp_server_path: Path) -> None:
-        """Spawn the MCP server subprocess and open a session."""
+    @property
+    def connected(self) -> bool:
+        return self._session is not None
+
+    async def start(self) -> None:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
-        if not mcp_server_path.is_file():
+        if not self.mcp_server_path.is_file():
             raise RuntimeError(
-                f"mcp_server.py not found at {mcp_server_path}; "
+                f"mcp_server.py not found at {self.mcp_server_path}; "
                 f"set WATCH_MCP_BIN env var"
             )
 
         params = StdioServerParameters(
             command=sys.executable,
-            args=[str(mcp_server_path)],
-            env=None,  # inherit
+            args=[str(self.mcp_server_path)],
+            env=None,
         )
 
-        # stdio_client returns an async context manager that yields
-        # (read_stream, write_stream). We need to keep it alive for the
-        # lifetime of the session. Store the cm on self.
         self._stdio_ctx = stdio_client(params)
         read, write = await self._stdio_ctx.__aenter__()
         self._session = ClientSession(read, write)
         await self._session.__aenter__()
         await self._session.initialize()
-        log.info("BFF connected to MCP server at %s", mcp_server_path)
+        log.info("slot[%d] connected to MCP server", self.index)
 
     async def stop(self) -> None:
-        """Tear down session + subprocess."""
         if self._session is not None:
             try:
                 await self._session.__aexit__(None, None, None)
             except Exception as exc:  # noqa: BLE001
-                log.warning("session close failed: %s", exc)
+                log.warning("slot[%d] session close failed: %s", self.index, exc)
             self._session = None
         if self._stdio_ctx is not None:
             try:
                 await self._stdio_ctx.__aexit__(None, None, None)
             except Exception as exc:  # noqa: BLE001
-                log.warning("stdio ctx close failed: %s", exc)
+                log.warning("slot[%d] stdio ctx close failed: %s", self.index, exc)
             self._stdio_ctx = None
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
-        """Call an MCP tool, serialize via lock.
-
-        FastMCP returns a list of content blocks; first TextContent has
-        the JSON-serialized result. We unwrap here so endpoints can
-        just return the parsed dict.
-        """
+        """Run a tool on this slot. Caller must hold no other locks;
+        this method acquires self.lock internally."""
         async with self.lock:
             if self._session is None:
-                raise RuntimeError("BFFState not started")
-            result = await self._session.call_tool(name, arguments)
+                raise RuntimeError(f"slot[{self.index}] not started")
+            with bff_metrics.time_block(name):
+                result = await self._session.call_tool(name, arguments)
             content = result.content
             if not content:
                 return {}
@@ -186,6 +219,129 @@ class BFFState:
                 return json.loads(text)
             except json.JSONDecodeError:
                 return {"raw": text}
+
+
+class BFFState:
+    """Phase 3.3: subprocess pool, not single subprocess.
+
+    N independent MCP subprocess + ClientSession pairs (default 4,
+    override via `WATCH_BFF_POOL_SIZE`). Tools are routed by
+    `video_id`: same video_id always lands on the same slot, so a
+    start_watch / get_status / get_results / cancel_watch sequence
+    for the same video runs on one subprocess. Cross-video calls
+    can run in parallel across slots.
+
+    Routing key: `video_id` if present in args, else a round-robin
+    counter so un-keyed calls (list_sessions, recompose with no
+    video_id) still distribute.
+    """
+
+    DEFAULT_POOL_SIZE = 4
+
+    def __init__(self) -> None:
+        self._slots: list[_Slot] = []
+        self._rr_counter = 0
+        self._stopping = False
+
+    @property
+    def pool_size(self) -> int:
+        return len(self._slots)
+
+    def is_running(self) -> bool:
+        return bool(self._slots) and all(s.connected for s in self._slots)
+
+    async def start(self, mcp_server_path: Path) -> None:
+        size = int(os.environ.get("WATCH_BFF_POOL_SIZE",
+                                  str(self.DEFAULT_POOL_SIZE)))
+        if size < 1:
+            size = 1
+        log.info("starting BFF pool with %d slots", size)
+        # Sequential start — each slot's stdio_client CM must be
+        # entered in the same task as its eventual __aexit__, otherwise
+        # anyio/Trio's cancel-scope safety check raises "Attempted
+        # to exit a cancel scope that isn't the current tasks's
+        # current cancel scope". Sequential is required, not just
+        # safer; pool size defaults to 4 so the start latency cost
+        # (~250ms × N) is acceptable.
+        started: list[_Slot] = []
+        try:
+            for i in range(size):
+                slot = _Slot(i, mcp_server_path)
+                await slot.start()
+                started.append(slot)
+            self._slots = started
+            bff_metrics.MCP_CONNECTED.set(1.0)
+        except Exception:
+            for s in started:
+                await s.stop()
+            raise
+
+    async def stop(self) -> None:
+        """Tear down every slot. Sequential (see start() comment)."""
+        bff_metrics.MCP_CONNECTED.set(0.0)
+        for s in self._slots:
+            await s.stop()
+        self._slots = []
+
+    async def __aenter__(self) -> "BFFState":
+        """Async CM support: `async with BFFState() as state: await state.start(path)`.
+
+        Phase 3.3: helps tests ensure start/stop happen in the same
+        anyio task — required for stdio_client CM cancel-scope safety.
+        Tests should prefer this over manual start/stop.
+        """
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.stop()
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        """Pick a slot and run the tool. Same `video_id` always lands
+        on the same slot so start_watch → get_status → get_results →
+        cancel_watch form a coherent conversation with one MCP server
+        process (essential for the cache-hits reuse path).
+        """
+        if not self._slots:
+            raise RuntimeError("BFFState not started")
+
+        slot = self._pick_slot(arguments)
+        bff_metrics.POOL_SIZE_USED.set(len(self._slots))
+        return await slot.call_tool(name, arguments)
+
+    def _pick_slot(self, arguments: dict) -> _Slot:
+        """Hash the video_id (if present) to a stable slot index.
+        Falls back to round-robin for tools that don't take
+        video_id (list_sessions, recompose without video_id).
+        """
+        video_id = arguments.get("video_id")
+        if isinstance(video_id, str) and video_id:
+            idx = hash(video_id) % len(self._slots)
+        else:
+            idx = self._rr_counter % len(self._slots)
+            self._rr_counter += 1
+        return self._slots[idx]
+
+    async def read_resource(self, uri: str) -> object:
+        """Resources (frame/mask bytes) are session-scoped — they
+        must hit the slot that owns the session_id in the URI. The
+        URI scheme is `watch-frame://<session_id>/frames/<file>`.
+        """
+        # Parse session_id from URI
+        # watch-frame://<sid>/...
+        if not uri.startswith("watch-frame://"):
+            raise ValueError(f"unsupported resource URI: {uri}")
+        rest = uri[len("watch-frame://"):]
+        sid = rest.split("/", 1)[0]
+        # Hash the session_id to the same slot as the originating
+        # tool call would have used. This works because we hash on
+        # whatever stable key is in the URI — sid is just as good
+        # as video_id for slot affinity.
+        idx = hash(sid) % len(self._slots)
+        slot = self._slots[idx]
+        async with slot.lock:
+            if slot._session is None:
+                raise RuntimeError(f"slot[{slot.index}] not started")
+            return await slot._session.read_resource(uri)
 
 
 # ─── Auth (Phase 2.7 placeholder, replaced by Phase 2.8 OAuth) ──────────
@@ -345,14 +501,78 @@ def create_app(state: BFFState | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def _metrics_middleware(request: Request, call_next):
+        """Bump request counters by tool name. The "tool" label is
+        derived from the URL path so /api/watch/{vid}/status counts
+        under "get_status", /api/watch/{vid}/cancel under
+        "cancel_watch", etc. Non-MCP endpoints count under their
+        path's first segment.
+        """
+        response = await call_next(request)
+        path = request.url.path
+        tool = _path_to_tool_label(path)
+        status_class = f"{response.status_code // 100}xx"
+        bff_metrics.REQUESTS_TOTAL.inc(tool=tool, status=status_class)
+        return response
+
     @app.get("/healthz")
     async def healthz():
+        # Pool-level readiness: at least one slot connected.
+        any_connected = any(s.connected for s in state._slots)
+        bff_metrics.MCP_CONNECTED.set(1.0 if any_connected else 0.0)
         return {
             "status": "ok",
-            "mcp_connected": state._session is not None,
+            "mcp_connected": any_connected,
+            "pool_size": len(state._slots),
             "auth_configured": _configured_token() is not None,
             "wechat_configured": wechat_oauth.is_configured(),
         }
+
+    @app.get("/readyz")
+    async def readyz():
+        """Readiness check — every pool slot is initialized AND
+        `list_tools` round-trips on at least one of them. Used by
+        load balancers / k8s readiness probes."""
+        if not state._slots:
+            return JSONResponse(
+                status_code=503,
+                content={"ready": False, "reason": "pool_not_started"},
+            )
+        for slot in state._slots:
+            if not slot.connected:
+                return JSONResponse(
+                    status_code=503,
+                    content={"ready": False,
+                             "reason": f"slot[{slot.index}] not connected"},
+                )
+        # Probe with the first connected slot — list_tools is cheap.
+        try:
+            async with state._slots[0].lock:
+                tools = await state._slots[0]._session.list_tools()
+            tool_names = sorted(t.name for t in tools.tools)
+            return {
+                "ready": True,
+                "pool_size": len(state._slots),
+                "tool_count": len(tool_names),
+                "tools": tool_names,
+            }
+        except Exception as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"ready": False, "reason": "list_tools_failed",
+                         "detail": str(exc)},
+            )
+
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus 0.0.4 text exposition format. Scraped by
+        Prometheus / VictoriaMetrics / mtail / etc. See bff_metrics.py."""
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(
+            content=bff_metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     # ── /auth/wechat/* (Phase 2.8) ──────────────────────────────────────
     #
@@ -451,9 +671,18 @@ def create_app(state: BFFState | None = None) -> FastAPI:
     async def watch_start(body: StartRequest, _user=Depends(require_user)):
         args = body.model_dump(exclude_none=True)
         try:
-            return await state.call_tool("start_watch", args)
+            result = await state.call_tool("start_watch", args)
         except RuntimeError as exc:
             raise HTTPException(409, detail={"error": str(exc)})
+        # Track active watches (cache-miss new job OR cache-hit with
+        # reused=False). reused=True means we returned a cached result;
+        # don't bump the gauge for that.
+        if not result.get("reused"):
+            bff_metrics.ACTIVE_WATCHES.set(
+                bff_metrics.ACTIVE_WATCHES._values.get(("active",), 0.0) + 1,
+                **{}  # gauge has no labels in current schema
+            )
+        return result
 
     @app.get("/api/watch/{video_id}/status")
     async def watch_status(video_id: str, _user=Depends(require_user)):
@@ -471,14 +700,16 @@ def create_app(state: BFFState | None = None) -> FastAPI:
     async def watch_frame(video_id: str, filename: str, _user=Depends(require_user)):
         """Stream raw JPEG bytes for a frame.
 
-        We have to call the MCP resource (not a tool) to get the bytes.
-        Goes through state.session.read_resource.
+        Routes to the pool slot that owns the session_id. We hash
+        the filename+video_id so the same video always lands on the
+        same slot (consistent with start_watch's video_id hash).
         """
-        async with state.lock:
-            if state._session is None:
+        slot = state._pick_slot({"video_id": video_id})
+        async with slot.lock:
+            if slot._session is None:
                 raise HTTPException(503, detail={"error": "mcp_disconnected"})
             uri = f"watch-frame://{video_id}/frames/{filename}"
-            result = await state._session.read_resource(uri)
+            result = await slot._session.read_resource(uri)
         if not result.contents:
             raise HTTPException(404, detail={"error": "frame_not_found"})
         block = result.contents[0]
@@ -492,11 +723,12 @@ def create_app(state: BFFState | None = None) -> FastAPI:
 
     @app.get("/api/watch/{video_id}/mask/{filename}")
     async def watch_mask(video_id: str, filename: str, _user=Depends(require_user)):
-        async with state.lock:
-            if state._session is None:
+        slot = state._pick_slot({"video_id": video_id})
+        async with slot.lock:
+            if slot._session is None:
                 raise HTTPException(503, detail={"error": "mcp_disconnected"})
             uri = f"watch-frame://{video_id}/masks/{filename}"
-            result = await state._session.read_resource(uri)
+            result = await slot._session.read_resource(uri)
         if not result.contents:
             raise HTTPException(404, detail={"error": "mask_not_found"})
         block = result.contents[0]

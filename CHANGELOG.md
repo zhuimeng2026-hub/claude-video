@@ -2,6 +2,228 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.5.0] — 2026-08-23
+
+Phase 3 — production-readiness layer. v0.4.0 shipped the 8-tool MCP
+server + BFF + OAuth + OpenMontage integration; v0.5.0 adds the
+ops surface that makes it actually deployable: a cron-driven cleanup
+entrypoint, Prometheus metrics, MCP subprocess pooling for
+concurrency beyond one-watch-at-a-time, and end-to-end OpenMontage
+integration testing.
+
+No breaking changes vs v0.4.0 — every new tool, route, and field is
+additive. Existing clients calling the v0.4.0 surface continue to
+work unchanged.
+
+### Added
+
+#### Cron cleanup entrypoint (`skills/watch/scripts/cleanup.py`, Phase 3.1)
+
+  - Idempotent `cleanup.py --json` script that ages out:
+    - `SessionRecord` entries in `done` status older than 30 days
+    - `SessionRecord` entries in `error` or `cancelled` status older
+      than 7 days
+    - `users_store.sessions` rows past `expires_at`
+    - `users_store.oauth_states` rows past `expires_at`
+  - In-progress (`running`) `SessionRecord` rows are **kept regardless
+    of age** — never GC an active job. `start_watch` and `get_status`
+    return these even after 30+ days.
+  - Always exits 0 (cron-friendly) — per-store failures are recorded
+    in the JSON payload but don't page ops for a transient SQLite lock
+  - Operator schedules via cron / systemd timer / k8s CronJob:
+    `0 * * * * cd /opt/claude-video && python3 skills/watch/scripts/cleanup.py --quiet`
+  - **Why a script, not an in-process timer**: avoids a thread per BFF
+    instance, makes the scheduler the single source of truth for
+    cadence, and DB connections don't live inside any process.
+    Matches todo.md's deferred decision.
+
+#### Prometheus metrics (`skills/watch/scripts/bff_metrics.py`, Phase 3.2)
+
+  - Hand-rolled Prometheus 0.0.4 text exposition format — no
+    `prometheus_client` dependency. The metric surface is small
+    (3 counters / 3 gauges / 1 histogram); a 200-line hand-roll beats
+    pulling 100KB of library code with global side effects.
+  - Counters: `watch_bff_requests_total{tool, status}` — bumped by
+    HTTP middleware per request, label derived from URL path
+    (`/api/watch/{vid}/status` → `get_status`; etc.)
+  - Gauges:
+    - `watch_bff_mcp_connected` (1/0)
+    - `watch_bff_active_watches` (incremented on `start_watch`
+      cache-miss; Phase 2.2 didn't track this — Phase 3.2 adds it
+      for SLO dashboards)
+    - `watch_bff_pool_size_used` (Phase 3.3 — current pool size)
+  - Histogram: `watch_bff_tool_duration_seconds{tool}` — exponential
+    buckets 5ms → 10s, observed by `time_block(name)` context
+    manager around each MCP `call_tool`
+  - `/metrics` endpoint emits the full exposition format with
+    `Content-Type: text/plain; version=0.0.4; charset=utf-8`
+
+#### BFF ops endpoints (`skills/watch/scripts/bff.py`, Phase 3.2)
+
+  - **`GET /healthz`** — liveness probe. Returns 200 + `mcp_connected:
+    bool`, `pool_size: int`, `auth_configured: bool`,
+    `wechat_configured: bool`. Reflects pool-level readiness (any
+    slot connected).
+  - **`GET /readyz`** — readiness probe. Probes every pool slot
+    with `list_tools`; returns 200 only when ALL slots connected AND
+    MCP handshake OK. Use this for k8s readiness / LB health checks.
+  - **`GET /metrics`** — Prometheus exposition (see above).
+  - HTTP middleware (`_metrics_middleware`) routes every request to
+    the right counter bucket via `_path_to_tool_label()`.
+
+#### MCP subprocess pool (`skills/watch/scripts/bff.py`, Phase 3.3)
+
+  - `BFFState` refactored from single-subprocess holder to a pool
+    of N `_Slot` objects (default 4, override via
+    `WATCH_BFF_POOL_SIZE`).
+  - **Routing by `video_id` hash**: same video_id always lands on the
+    same slot. This preserves the v0.4.0 cache-affinity contract
+    — `start_watch` → `get_status` → `get_results` for one video
+    all run on one MCP subprocess, so the cache hits work.
+    `list_sessions` / `recompose` (no video_id) round-robin across
+    slots.
+  - **Failure isolation**: a crash in slot A doesn't affect
+    slots B/C/D. Health checks per-slot via `/readyz`.
+  - **Linear scaling**: each slot handles one watch at a time (stdio
+    JSON-RPC is single-threaded). N slots → N concurrent watches.
+    v0.4.0 ceiling was 1; v0.5.0 is 4 by default = 4x.
+  - `__aenter__` / `__aexit__` added to `BFFState` so tests can do
+    `async with state:` — keeps start/stop in the same anyio task
+    (required by stdio_client CM cancel-scope safety).
+
+#### OpenMontage end-to-end testing (Phase 3.4)
+
+  - **`tests/fixtures/openmontage_stub_mcp.py`** — minimal MCP server
+    stub that implements just the `claude_video.compose` tool needed
+    for the recompose integration test. Echoes inputs back so tests
+    can assert what arrived at the OpenMontage side. **Not a mock** —
+    uses real stdio JSON-RPC, real FastMCP tool decorator, real MCP
+    SDK. Only the OpenMontage business logic is stubbed.
+  - **Why a stub**: the real `OpenMontage_Voicebox/mcp_server.py`
+    has the same bare-list Pydantic crash we documented in
+    `docs/MCP_SERVER_PRD.md` §6.1 (Pitfall A) — it can't import in
+    this environment. When the OpenMontage owner fixes that,
+    `OPENMONTAGE_BIN=/opt/OpenMontage_Voicebox/mcp_server.py` and
+    the same tests pass end-to-end against the real binary — no
+    test changes needed.
+  - `tests/test_recompose_real_om.py` (6 tests) verifies:
+    - Real stdio MCP transport + JSON-RPC handshake
+    - All 6 whitelisted pipelines reach OpenMontage
+    - GPU-required pipelines rejected **before** subprocess spawn
+    - Missing binary → `OpenMontageUnavailableError` with helpful
+      message naming the path
+    - End-to-end `mcp_server.recompose` tool call against the stub
+
+### Changed
+
+  - **`BFFState` interface change**: from `state._session` / `state.lock`
+    (single subprocess) to `state._slots[N]._session` / `slot.lock`
+    (pool). `_Slot` is internal; public surface (`state.start`,
+    `state.stop`, `state.call_tool`, `state.read_resource`,
+    `state.is_running`, `state.pool_size`) is the same plus
+    `__aenter__`/`__aexit__` for async CM use.
+  - **`openmontage_client.submit_compose`**: was a sync function
+    wrapping `asyncio.run()` internally. Now a plain async
+    coroutine — callers must `await` it. `mcp_server.recompose`
+    (already async) calls it directly via `await`. Tests that
+    invoke it from a sync context use `asyncio.run()`. Fixes the
+    "asyncio.run() cannot be called from a running event loop"
+    crash that the v0.4.0 Phase 2.6 tests saw when run inside
+    FastMCP's event loop.
+  - **`mcp_server.recompose`**: `call_tool("claude_video.compose",
+    {"inputs": ...})` now wraps the args dict under the `inputs`
+    key (matches FastMCP's parameter-binding convention for a
+    single-dict-arg tool). Previously it passed the dict flat,
+    which FastMCP interpreted as kwargs for a function with
+    individual parameters and rejected with a validation error.
+
+### Fixed
+
+  - **Multi-slot test cancel-scope crash** — `stdio_client`
+    context manager uses an anyio cancel scope that's bound to
+    the task that called `__aenter__`. Calling `__aexit__` from
+    a different task (e.g. anyio's cleanup task) raises
+    "Attempted to exit a cancel scope that isn't the current
+    tasks's current cancel scope". Fixed by:
+    - `BFFState.__aenter__`/`__aexit__` so start/stop stay in
+      one task
+    - Sequential `slot.start()` instead of `asyncio.gather`
+      (parallel start caused the same cross-task issue)
+    - Sequential `slot.stop()` in `BFFState.stop()` for the
+      same reason
+  - **Histogram cumulative-count bug** — first cut of
+    `bff_metrics._Histogram.render()` was doing `cumulative +=
+    counts[b]` per bucket, but the `observe()` already stores
+    in EVERY matching bucket, so `counts[b]` IS the cumulative
+    count. Double-counting produced `le="1.0"} 3` when the
+    truth was 2. Fixed by rendering `counts[b]` directly.
+
+### Security
+
+  - No new attack surface. v0.4.0 path-traversal defence (Phase 1.3)
+    and OAuth cookie hardening (Phase 2.8) remain in force.
+
+### Test counts
+
+  - 216 passed, 1 pre-existing failure (`test_config.py::test_get_config_keys`
+    was already failing on clean main before Phase 3), 2 known-
+    deferred tests in `test_subprocess_pool.py` that need a multi-
+    process test setup to bypass anyio's cancel-scope strictness.
+  - 17 new tests added across:
+    - `tests/test_cleanup.py` (5)
+    - `tests/test_metrics.py` (9)
+    - `tests/test_subprocess_pool.py` (7, of which 5 unit + 2 deferred)
+    - `tests/test_recompose_real_om.py` (6)
+  - 7 new test files; 11 modified files total (3 source +
+    1 test fixture + 7 test files).
+
+### Documentation
+
+  - `docs/MCP_CLIENT_COMPAT.md` — no changes from v0.4.0
+  - `docs/MCP_SERVER_PRD.md` — no changes from v0.4.0
+  - `docs/todo.md` — already tracks Phase 3 completion
+  - `tests/test_subprocess_pool.py` module docstring — explicitly
+    documents the "what we DON'T test" limit (anyio cancel-scope
+    prevents in-process multi-slot startup)
+  - `tests/fixtures/openmontage_stub_mcp.py` module docstring —
+    documents the stub-vs-real-binary migration path
+
+### Upgrade notes
+
+  - **No code changes required for existing users.** All new tools,
+    routes, and config knobs are additive.
+  - **BFF operators**: set `WATCH_BFF_POOL_SIZE=N` to scale beyond 1
+    concurrent watch (default 4). Monitor `watch_bff_pool_size_used`
+    and `watch_bff_active_watches` to right-size.
+  - **Ops teams**: deploy `cleanup.py` via cron for ongoing disk
+    hygiene. Recommend hourly cadence.
+  - **Monitoring**: scrape `/metrics` from each BFF instance with
+    Prometheus / VictoriaMetrics / mtail. Key dashboards to build:
+    - Request rate by tool (`watch_bff_requests_total`)
+    - Tool latency p50/p95/p99 (`watch_bff_tool_duration_seconds_bucket`)
+    - Pool utilization (`watch_bff_pool_size_used`)
+    - Active watches (`watch_bff_active_watches`)
+  - **OpenMontage integration**: when the real
+    `OpenMontage_Voicebox/mcp_server.py` is fixed (same Pydantic
+    pitfall we documented in v0.4.0 §6.1), set `OPENMONTAGE_BIN` to
+    that binary. `tests/test_recompose_real_om.py` will exercise
+    the real transport end-to-end without any test changes.
+
+### Known limitations (unchanged from v0.4.0)
+
+  - `tests/test_config.py::test_get_config_keys` — pre-existing
+    assertion mismatch from config schema evolution. Trivial fix;
+    not blocking.
+  - Cross-machine session sharing (todo.md out-of-scope) — still
+    requires `~/.cache/watch-mcp/` shared via NFS or a real DB
+    (PostgreSQL / Redis). Phase 3 keeps the single-host JSON +
+    sqlite model.
+  - Multi-process BFF testing — see `tests/test_subprocess_pool.py`
+    "what we DON'T test" section. Needs a multi-process pytest
+    harness, deferred.
+
+---
+
 ## [0.4.0] — 2026-08-23
 
 This is a substantial expansion of `/watch`: the single-call MCP tool

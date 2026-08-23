@@ -36,9 +36,17 @@ def _free_port() -> int:
 
 @pytest.fixture
 def isolated_state(tmp_path, monkeypatch):
-    """Per-test BFF state + redirected session_store."""
+    """Per-test BFF state + redirected session_store.
+
+    Phase 3.3 pool: force WATCH_BFF_POOL_SIZE=1 for these tests
+    (each test owns one MCP subprocess). Multi-slot pool semantics
+    have their own dedicated test in tests/test_subprocess_pool.py —
+    spawning N stdio_client CMs in the same anyio task hits a
+    cancel-scope safety check that's hard to bypass in unit tests.
+    """
     import bff
     import session_store
+    monkeypatch.setenv("WATCH_BFF_POOL_SIZE", "1")
 
     session_store._reset_for_tests(tmp_path / "watch-store")
     state = bff.BFFState()
@@ -52,13 +60,15 @@ def isolated_state(tmp_path, monkeypatch):
 async def _with_state(state, app):
     """Run lifespan manually (ASGITransport doesn't always trigger it
     correctly with our custom lifespan; using the wrapper directly
-    ensures the mcp subprocess actually starts)."""
-    mcp_bin = SCRIPTS_DIR / "mcp_server.py"
-    await state.start(mcp_bin)
-    try:
-        yield app
-    finally:
-        await state.stop()
+    ensures the mcp subprocess actually starts). Uses state as async
+    CM so start/stop happen in the same anyio task — required for
+    stdio_client CM cancel-scope safety (Phase 3.3 pool)."""
+    async with state:
+        await state.start(SCRIPTS_DIR / "mcp_server.py")
+        try:
+            yield app
+        finally:
+            await state.stop()
 
 
 # ─── Health ───────────────────────────────────────────────────────────────
