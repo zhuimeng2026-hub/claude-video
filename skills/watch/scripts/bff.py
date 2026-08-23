@@ -201,37 +201,45 @@ async def require_user(
 ) -> dict:
     """Phase 2.7 placeholder + Phase 2.8 OAuth.
 
-    Two modes, picked at startup based on whether WeChat is configured:
+    Three modes, picked at startup based on env config:
 
-    1. **Bearer token (dev / inter-service)**: when WATCH_BFF_AUTH_TOKEN
-       env is set, callers must send `Authorization: Bearer <token>`.
+    1. **WeChat cookie (browser, prod)**: when WECHAT_MP_APP_ID env is
+       set, callers MUST send a valid WATCH_SESSION cookie. Missing /
+       expired cookie → 401, never dev-bypass.
 
-    2. **WeChat cookie (browser)**: when WECHAT_MP_APP_ID env is set,
-       callers must send a valid WATCH_SESSION cookie. WeChat takes
-       priority — if BOTH are configured, WeChat is used (production
-       default).
+    2. **Bearer token (dev / inter-service)**: when WATCH_BFF_AUTH_TOKEN
+       env is set but WeChat is NOT, callers must send
+       `Authorization: Bearer <token>`. Missing → 401.
 
-    3. **Dev bypass**: when NEITHER is configured, all requests pass.
-       Used by `tests/test_bff.py` and `tests/test_oauth_phase28b.py`.
+    3. **Dev bypass**: when NEITHER is configured (used by tests).
     """
-    # Phase 2.8: prefer WeChat cookie if configured
+    # 1) WeChat cookie path — when configured, this is the only auth
     if wechat_oauth.is_configured() and request is not None:
         sid = request.cookies.get("WATCH_SESSION")
-        if sid:
-            sess = users_store.get_session(sid)
-            if sess is not None:
-                # Sliding window — bump expiry
-                users_store.extend_session(sid)
-                user = users_store.get_user(sess.openid)
-                return {
-                    "auth": "wechat",
-                    "user_openid": sess.openid,
-                    "user_unionid": user.unionid if user else None,
-                    "session_id": sid,
-                }
-            # Cookie present but invalid/expired — fall through to other modes
+        if not sid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "not_authenticated",
+                        "message": "missing WATCH_SESSION cookie; redirect to /auth/wechat/login"},
+            )
+        sess = users_store.get_session(sid)
+        if sess is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "session_invalid",
+                        "message": "WATCH_SESSION expired or unknown; redirect to /auth/wechat/login"},
+            )
+        # Sliding window — bump expiry on each authenticated request
+        users_store.extend_session(sid)
+        user = users_store.get_user(sess.openid)
+        return {
+            "auth": "wechat",
+            "user_openid": sess.openid,
+            "user_unionid": user.unionid if user else None,
+            "session_id": sid,
+        }
 
-    # Phase 2.7: bearer token fallback
+    # 2) Bearer token path
     expected = _configured_token()
     if expected is not None:
         if not authorization or not authorization.lower().startswith("bearer "):
@@ -248,7 +256,7 @@ async def require_user(
             )
         return {"auth": "bearer", "user": presented[:8] + "..."}
 
-    # Dev bypass
+    # 3) Dev bypass — only when NO auth scheme is configured
     return {"auth": "dev-bypass"}
 
 
@@ -343,6 +351,98 @@ def create_app(state: BFFState | None = None) -> FastAPI:
             "status": "ok",
             "mcp_connected": state._session is not None,
             "auth_configured": _configured_token() is not None,
+            "wechat_configured": wechat_oauth.is_configured(),
+        }
+
+    # ── /auth/wechat/* (Phase 2.8) ──────────────────────────────────────
+    #
+    # WeChat service-account OAuth flow. State persisted in users.sqlite3
+    # via users_store. Cookie name: WATCH_SESSION (HttpOnly, SameSite=Lax,
+    # Secure when WATCH_BFF_COOKIE_SECURE=true).
+
+    COOKIE_NAME = "WATCH_SESSION"
+    COOKIE_SECURE = os.environ.get("WATCH_BFF_COOKIE_SECURE", "true").lower() == "true"
+
+    @app.get("/auth/wechat/login")
+    async def wechat_login(redirect: str = "/"):
+        """Step 1: mint CSRF state, redirect to WeChat authorize URL."""
+        if not wechat_oauth.is_configured():
+            raise HTTPException(status_code=503, detail={
+                "error": "wechat_not_configured",
+                "message": "管理员未配置微信登录;WECHAT_MP_APP_ID 等 env 缺失",
+            })
+        # Validate redirect: only allow same-origin paths (no open redirect)
+        if not redirect.startswith("/") or redirect.startswith("//"):
+            redirect = "/"
+        state = users_store.create_oauth_state(redirect)
+        url = wechat_oauth.build_authorize_url(state)
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=url, status_code=302)
+
+    @app.get("/auth/wechat/callback")
+    async def wechat_callback(
+        code: str,
+        state: str,
+    ):
+        """Step 2: WeChat redirects here with code+state. Exchange
+        code for token, fetch userinfo, mint session cookie, redirect
+        back to the originally-requested page."""
+        from fastapi.responses import RedirectResponse
+        consumed = users_store.consume_oauth_state(state)
+        if consumed is None:
+            raise HTTPException(status_code=400, detail={
+                "error": "invalid_or_expired_state",
+                "message": "OAuth state 已过期或被使用,请重新发起登录",
+            })
+        try:
+            tok = await wechat_oauth.exchange_code_for_token(code)
+        except wechat_oauth.WeChatAPIError as exc:
+            raise HTTPException(status_code=400, detail={
+                "error": "wechat_token_exchange_failed",
+                "errmsg": exc.errmsg,
+            })
+        # Try to fetch userinfo (only available if scope was snsapi_userinfo).
+        # If it fails (silent scope), proceed with openid only.
+        try:
+            info = await wechat_oauth.get_userinfo(tok.access_token, tok.openid)
+            nickname = info.get("nickname")
+            unionid = info.get("unionid") or tok.unionid
+        except wechat_oauth.WeChatAPIError:
+            nickname = None
+            unionid = tok.unionid
+
+        users_store.upsert_user(tok.openid, unionid=unionid, nickname=nickname)
+        sess = users_store.create_session(tok.openid)
+
+        resp = RedirectResponse(url=consumed.redirect_after, status_code=302)
+        resp.set_cookie(
+            key=COOKIE_NAME,
+            value=sess.id,
+            httponly=True,
+            secure=COOKIE_SECURE,
+            samesite="lax",
+            max_age=7 * 24 * 3600,
+        )
+        return resp
+
+    @app.post("/auth/logout")
+    async def wechat_logout(request: Request):
+        """Invalidate server-side session and clear the cookie."""
+        sid = request.cookies.get(COOKIE_NAME)
+        if sid:
+            users_store.delete_session(sid)
+        from fastapi.responses import JSONResponse
+        resp = JSONResponse({"logged_out": True})
+        resp.delete_cookie(COOKIE_NAME)
+        return resp
+
+    @app.get("/auth/me")
+    async def wechat_me(user=Depends(require_user)):
+        """Return the current authenticated user (no MCP call needed)."""
+        return {
+            "auth": user.get("auth"),
+            "user_openid": user.get("user_openid"),
+            "user_unionid": user.get("user_unionid"),
         }
 
     # ── /api/watch/* ─────────────────────────────────────────────────────
