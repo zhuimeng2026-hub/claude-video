@@ -257,4 +257,249 @@ console.log(JSON.parse(content[0].text).session_id);
 - Setup / compat probe: `skills/watch/scripts/setup.py` → `_check_mcp_server_compat()`, `_ensure_scripts_on_path()`
 - SDK pin: `requirements.txt` (`mcp>=1.20,<2.0`)
 - MCP spec: https://modelcontextprotocol.io/specification/2024-11-05
+- Phase 2.7 BFF (browser REST + SSE proxy): [`skills/watch/scripts/bff.py`](../skills/watch/scripts/bff.py), tested in [`tests/test_bff.py`](../tests/test_bff.py)
+
+---
+
+## 10. Web service + browser integration patterns
+
+The §7 examples are raw stdio clients — good for tooling and
+one-shot scripts. This section covers three production patterns:
+
+  **A.** Node.js web service that wraps the MCP server (exposes MCP
+        behind a REST endpoint, e.g. for a Telegram bot, Slack
+        integration, or internal tool).
+  **B.** Python web service (FastAPI / Flask / Django) wrapping MCP.
+  **C.** Browser SPA (vanilla JS / React / Vue) hitting the Phase 2.7
+        BFF's REST + SSE endpoints — does NOT need MCP SDK at all.
+
+The BFF (Pattern C) is the recommended approach for browser clients
+because MCP's long-connection stdio transport can't be exposed directly
+to a browser without complications (CORS, auth, framing). The BFF
+adds an HTTP+SSE surface in front; the MCP server stays an internal
+subprocess.
+
+### 10.1 Pattern A — Node.js web service wrapping stdio MCP
+
+Use when you need to expose `/watch` to a non-browser client (a
+chatbot, a CLI tool, a server-side job runner). The Node service
+spawns the MCP server as a child process and translates HTTP requests
+to MCP `tools/call`.
+
+```js
+// server.js — minimal Express + MCP stdio client
+import express from "express";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const client = new Client(
+  { name: "my-web-svc", version: "0.1.0" },
+  { capabilities: {} }
+);
+const transport = new StdioClientTransport({
+  command: "python3",
+  args: ["/abs/path/to/skills/watch/scripts/mcp_server.py"],
+});
+await client.connect(transport);
+
+const app = express();
+app.use(express.json());
+
+app.post("/watch", async (req, res) => {
+  const { content } = await client.callTool({
+    name: "watch",
+    arguments: { ...req.body, no_whisper: true },
+  });
+  const result = JSON.parse(content[0].text);
+  // Return frame URIs to your client — they can fetch each via
+  // mcp_client.readResource({ uri: result.frame_uris[0] }).
+  res.json({
+    video_id: result.video_id,
+    session_id: result.session_id,
+    report: result.report,
+    frames: result.frame_uris,
+  });
+});
+
+app.get("/frame/:sid/:filename", async (req, res) => {
+  const uri = `watch-frame://${req.params.sid}/frames/${req.params.filename}`;
+  const { contents } = await client.readResource({ uri });
+  const block = contents[0];
+  // BlobResourceContents.blob is base64-encoded bytes (Phase 1.5
+  // §4.1 in this doc; the same gotcha applies here).
+  res.set("content-type", "image/jpeg");
+  res.send(Buffer.from(block.blob, "base64"));
+});
+
+app.listen(8910, () => console.log("watch proxy on :8910"));
+```
+
+Operational notes:
+  - **One MCP subprocess per Node service process**. Don't try to
+    pool MCP clients — stdio JSON-RPC is one connection per server.
+    If you need concurrency, run multiple Node processes.
+  - **Long-running calls block the HTTP request**. For Phase 2.2+
+    tools (`start_watch` / `get_status` / `get_results`), do
+    `start_watch` → return immediately → poll `get_status` from
+    a separate HTTP endpoint that your UI calls.
+  - **BFF pattern (10.3) is simpler** if you don't need stdio
+    directly — just proxy the BFF instead.
+
+### 10.2 Pattern B — Python web service wrapping stdio MCP
+
+Same shape as 10.1, in Python. Use FastAPI for parity with the
+Phase 2.7 BFF.
+
+```python
+# server.py
+import asyncio, json
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+@asynccontextmanager
+async def lifespan(app):
+    params = StdioServerParameters(
+        command="python3",
+        args=["/abs/path/to/skills/watch/scripts/mcp_server.py"],
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            app.state.session = session
+            yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/watch")
+async def watch(body: dict):
+    result = await app.state.session.call_tool("watch", body)
+    return json.loads(result.content[0].text)
+
+@app.get("/frame/{sid}/{filename}")
+async def frame(sid: str, filename: str):
+    import base64
+    uri = f"watch-frame://{sid}/frames/{filename}"
+    res = await app.state.session.read_resource(uri)
+    block = res.contents[0]
+    raw = base64.b64decode(block.blob)  # see §4.1
+    from fastapi.responses import Response
+    return Response(content=raw, media_type="image/jpeg")
+```
+
+Run with: `uvicorn server:app --host 0.0.0.0 --port 8910`.
+
+### 10.3 Pattern C — Browser via Phase 2.7 BFF (recommended)
+
+For SPAs / dashboards / anything browser-based, **don't try to use
+the MCP SDK directly**. Use the BFF: HTTP for control plane + SSE
+for progress. EventSource auto-reconnects, fetch is plain HTTP.
+
+```html
+<!-- index.html — minimal SPA calling the BFF -->
+<script type="module">
+  // 1. Kick off a watch (returns 202 with video_id immediately)
+  const startResp = await fetch("/api/watch/start", {
+    method: "POST",
+    credentials: "include",  // send WATCH_SESSION cookie
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      source: "https://youtu.be/dQw4w9WgXcQ",
+      detail: "balanced",
+      video_id: "my-video-1",
+    }),
+  });
+  const { video_id, session_id, status } = await startResp.json();
+  console.log("started", video_id, "session", session_id, status);
+
+  // 2. Open SSE for live progress (auto-reconnects on disconnect)
+  const events = new EventSource(
+    `/api/watch/${video_id}/events`,
+    { withCredentials: true }
+  );
+  events.addEventListener("progress", (e) => {
+    const data = JSON.parse(e.data);
+    document.getElementById("stage").textContent = data.stage;
+    document.getElementById("progress").value = data.progress ?? 0;
+  });
+  events.addEventListener("final", (e) => {
+    const data = JSON.parse(e.data);
+    if (data.status === "done") {
+      // 3. Fetch the full result
+      fetchResults(video_id);
+    }
+    events.close();
+  });
+
+  async function fetchResults(vid) {
+    const r = await fetch(`/api/watch/${vid}/results`, {
+      credentials: "include",
+    });
+    const data = await r.json();
+    // 4. Render frames
+    for (const uri of data.frame_uris) {
+      // uri format: watch-frame://<sid>/frames/<file>
+      const u = new URL(uri);
+      const sid = u.host;
+      const filename = u.pathname.split("/").pop();
+      const img = document.createElement("img");
+      img.src = `/api/watch/${sid}/frame/${filename}`;
+      img.alt = "frame";
+      document.body.appendChild(img);
+    }
+  }
+</script>
+```
+
+Server requirements to host this:
+  - **HTTPS** in production (Phase 2.8 cookie is Secure-flagged).
+  - **Reverse proxy** (nginx / Caddy) terminating TLS and forwarding
+    to the BFF on `127.0.0.1:8910`.
+  - **Cookie domain** = your public host (e.g. `claude-video.example.com`),
+    so `WATCH_SESSION` set on login survives across `/api/*` and `/auth/*`.
+  - **CORS**: BFF defaults allow `http://localhost:*` and `tauri://`.
+    Override with `WATCH_BFF_CORS_ORIGINS=https://your-spa.example.com`
+    in production.
+
+### 10.4 Architecture comparison
+
+| Pattern | Process model | Browser-compatible | Recommended for |
+|---|---|---|---|
+| **A. Node.js stdio wrap** | 1 Node process + 1 MCP subprocess | ❌ (stdio is local) | Slack/Telegram bots, internal tools, CLI tooling |
+| **B. Python stdio wrap** | 1 Python process + 1 MCP subprocess | ❌ (stdio is local) | Same as A, when Python is preferred |
+| **C. Browser via BFF** | 1 BFF + 1 MCP subprocess + N browsers | ✅ (HTTP+SSE) | SPAs, dashboards, anything user-facing |
+
+Pattern C is the only one that scales to multiple concurrent users.
+A and B are fine for single-process automation; if you need to scale,
+either:
+  - Run multiple instances of A/B behind a load balancer (each
+    handles one session at a time due to stdio serialization), OR
+  - Migrate to Pattern C and put the BFF behind your load balancer.
+
+### 10.5 Migration path: stdio wrap → BFF
+
+If you start with Pattern A or B and later need browsers, the
+migration is mechanical:
+
+  1. **Don't rewrite the MCP server** — keep it as-is.
+  2. **Run the BFF** (`skills/watch/scripts/bff.py`) as a separate
+     process. It spawns its own MCP subprocess and proxies HTTP →
+     stdio. No changes to A/B needed.
+  3. **Update the SPA** to call the BFF instead of A/B (Pattern C).
+  4. **Keep A/B** for non-browser automation if they're still useful
+     (e.g. a cron job that runs `start_watch` once a day).
+
+The BFF is intentionally lightweight — it does NOT reimplement
+session logic. It just translates HTTP to MCP. All the cache,
+cancellation, and pipeline state stay in the MCP server's
+`session_store.py` + `pipeline_runner.py`.
+
+### 10.6 Direct stdio → BFF at scale
+
+For very high concurrency, the BFF's single-MCP-subprocess model
+becomes a bottleneck (one watch at a time). Phase 3.x will add a
+"subprocess pool" mode where the BFF spawns N MCP subprocesses and
+round-robins requests. Tracked separately — MVP is fine for tens
+of concurrent users.
 - mcp Python SDK: https://github.com/modelcontextprotocol/python-sdk
