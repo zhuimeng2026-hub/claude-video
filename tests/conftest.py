@@ -89,3 +89,12 @@ def static_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "static.mp4"
     build_static_clip(path)
     return path
+
+
+# ─── anyio backend for Phase 2.7 BFF tests ─────────────────────────────────
+import anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
