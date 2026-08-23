@@ -133,16 +133,22 @@ Phase 2.8)
     changes, emits `data: {json}\n\n` SSE records. Used directly by
     LAN clients or proxied through the BFF.
 
-#### Standalone CLI converters (Phase 2.6.1, re-enabled)
+#### Standalone CLI converters (Phase 2.6.1, **disabled** — kept as `.py_tmp`)
 
-  - `watch_to_remotion.py` and `watch_to_remotion_smart.py` are
-    **re-enabled** as standalone CLI tools per `docs/MCP_SERVER_PRD.md`
-    §1.3. They are usable as standalone tools but **must not be
-    invoked from the `/watch` MCP server's main flow** — the
-    `recompose` tool routes through OpenMontage only. The four
-    §2.6.1 conditions (adapter refactor / env guard / guard test /
-    no-FastMCP-coupling) remain as regression-prevention work; the
-    `OPENMONTAGE_REQUIRED` env guard is not yet wired.
+  - `watch_to_remotion.py` and `watch_to_remotion_smart.py` remain
+    on disk as `watch_to_remotion.py_tmp` and
+    `watch_to_remotion_smart.py_tmp` respectively (the v0.3.0
+    "disable by rename" pattern from commit `1cac74b`, restored
+    after a brief same-day re-enable in `73c92da` and immediate
+    revert in `895520b`). Python's import system ignores them, so
+    nothing in the `/watch` MCP server's main flow can call them
+    accidentally. **They are not usable as CLI tools in v0.4.0** —
+    only the re-enable path (`mv *.py_tmp *.py`) would make them
+    importable, and that's gated on the four §2.6.1 conditions
+    (adapter refactor / `OPENMONTAGE_REQUIRED` env guard /
+    `test_remotion_guard.py` / no-FastMCP-coupling) landing first.
+    See `docs/MCP_SERVER_PRD.md` §1.3 for the rationale and
+    `docs/todo.md` §2.6.1 for the four open items.
 
 ### Changed
 
@@ -177,11 +183,12 @@ Phase 2.8)
 ### Removed
 
   - Nothing in v0.4.0 removes user-facing functionality. The two
-    Remotion scripts that the v0.3.0 saga tried to disable are
-    **kept on disk and re-enabled as standalone CLI tools** (see
-    Added above). The `.py_tmp` park is still the safe state per
-    `docs/MCP_SERVER_PRD.md` §1.3; if you see `.py` extensions
-    rather than `.py_tmp`, that's the same code, just enabled.
+    Remotion scripts that the v0.3.0 saga disabled are **still
+    disabled in v0.4.0** — kept on disk as `.py_tmp` (see Added
+    above), not importable, not part of any CLI surface. The
+    `mv *.py_tmp *.py` re-enable path is gated on the four §2.6.1
+    conditions; until they land, "recomposition" means
+    `recompose` → OpenMontage only.
 
 ### Security
 
