@@ -38,7 +38,7 @@
 
 ### 1.4 兼容性矩阵
 
-- [ ] 写 `docs/MCP_CLIENT_COMPAT.md`,列出测试过的客户端:openclaw / Claude Desktop / MCP Inspector / 自写 stdio 客户端,每个记协议版本、最小复现命令
+- [x] 写 `docs/MCP_CLIENT_COMPAT.md`,列出测试过的客户端:openclaw / Claude Desktop / MCP Inspector / 自写 stdio 客户端,每个记协议版本、最小复现命令 → 已落地 (§2 矩阵 + §5 三步验证 probe)
 
 **Phase 1 完成标志**:任何 200 行内的 stdio 客户端都能跑通 `watch` + 拉帧,且 `pytest -q` 全绿。
 
@@ -92,7 +92,7 @@
 
 **路径 2(MVP 选这个)**:Phase 2.7 BFF 把 REST/SSE 翻译成 stdio MCP。**用户感觉像 REST,底层是 MCP。**
 
-- [ ] 在 `docs/MCP_CLIENT_COMPAT.md` 加一节:"Node.js web 服务接入示例",用官方 `@modelcontextprotocol/sdk` 的 `StdioClientTransport`,10 行代码示例
+- [x] 在 `docs/MCP_CLIENT_COMPAT.md` 加一节:"Node.js web 服务接入示例",用官方 `@modelcontextprotocol/sdk` 的 `StdioClientTransport`,10 行代码示例 → 已落地 (§7.3)
 - [ ] 加一节"Python web 服务示例",用 `mcp.client.session.stdio`
 - [ ] 加一节"浏览器接入示例":`fetch('/api/watch/start', ...)` + `new EventSource('/api/watch/{video_id}/events')`,展示 SSE 自动重连
 - [ ] 明确告诉用户:stdio 一个进程跑一个 web 服务,BFF 跑在另一进程;扩展时 BFF 可换成 `mcp.run_streamable_http_async()` 端点但默认不开
@@ -109,7 +109,7 @@
 
 #### 2.6.1 旧脚本退役 + 守卫
 
-> **现状 (2026-08-23)**: 两个 Remotion 脚本已经**重命名为 `.py_tmp`**(`watch_to_remotion.py_tmp`、`watch_to_remotion_smart.py_tmp`),作为**临时**禁用手段 — Python 不会 import 它们,SKILL.md / watch.py 也没有引用,所以暂时不会被误调。**下面四件事全部完成后,再把后缀 `_tmp` 去掉、重新启用**:
+> **Status (2026-08-23, updated)**: **Re-enabled by user override.** The `.py_tmp` files were accidentally deleted in commit `0538676` (Phase 2.x commit, side-effect of the broader Phase 2 work), which closed the documented re-enable path. On 2026-08-23 the user restored the files and renamed them back to `.py` so the canonical filenames work. **The 4 conditions below remain open** — adapter refactor not done, env guard not added, `test_remotion_guard.py` not added. They are now **regression-prevention work** rather than re-enable gates: the scripts are importable again, but anyone working on them must respect the §2.6 "v2+ must route through OpenMontage" hard constraint (don't invoke from the `/watch` MCP server's main flow). The original "现状" block (`.py_tmp` park) is preserved as historical record below for completeness.
 
 
 - [ ] `skills/watch/scripts/watch_to_remotion.py`:删除 `subprocess.run(["npx", "remotion", ...])` 路径(`watch_to_remotion.py:101` 附近的 `ffprobe` 调用可以保留——它只是探测时长,不渲染);脚本改为 **adapter**:把 watch 产物(VTT + frames + video)打包成 OpenMontage 可消费的输入清单,调用 OpenMontage 的 MCP tool `execute_tool(tool_name="video_compose", inputs={...})` 提交
@@ -186,7 +186,7 @@
 - web 服务可以在 30 行代码内启动 watch、订阅进度、按 video_id 拉帧
 - 调用 `recompose` 后,产物出现在 `OpenMontage_Voicebox/projects/<id>/renders/final.mp4`,并能在 Backlot 里查看
 - `pytest -q` 覆盖拆分 tool + 重组 + cancel + timeout + 同 video_id 增量 segment + remotion guard
-- `docs/MCP_CLIENT_COMPAT.md` 增加 node + python 完整示例
+- [x] `docs/MCP_CLIENT_COMPAT.md` 增加 node + python 完整示例 → 已落地 (§7.2 + §7.3)
 - `grep -r "npx remotion" skills/` 在 main 分支返回 0 行(除了注释里说明"已禁用")
 
 ---
